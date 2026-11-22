@@ -1,0 +1,32 @@
+{
+  "expo": {
+    "name": "PAPA",
+    "slug": "papa",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "backgroundColor": "#1E3FA0",
+    "splash": {
+      "image": "./assets/splash.png",
+      "backgroundColor": "#1E3FA0",
+      "resizeMode": "contain"
+    },
+    "ios": {
+      "bundleIdentifier": "org.christanointed.papa",
+      "supportsTablet": false
+    },
+    "android": {
+      "package": "org.christanointed.papa",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#1E3FA0"
+      }
+    },
+    "newArchEnabled": true,
+    "plugins": ["expo-secure-store"],
+    "extra": {
+      "apiUrl": "http://localhost:3000"
+    }
+  }
+}
