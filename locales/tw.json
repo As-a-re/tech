@@ -1,0 +1,24 @@
+{
+  "nav": {
+    "home": "Fie",
+    "announcements": "Dawurubɔ",
+    "events": "Nhyiamu",
+    "prayer": "Mpaebɔ",
+    "groups": "Akuo",
+    "messages": "Nkra",
+    "children": "Mmofra",
+    "market": "Gua"
+  },
+  "prefs": {
+    "language": "Kasa",
+    "light": "Hann",
+    "dark": "Sum"
+  },
+  "home": {
+    "title": "Yɛma wo akwaaba wɔ PAPA so",
+    "verseRef": "Nnwom 133:1"
+  },
+  "errors": {
+    "goHome": "Kɔ Fie"
+  }
+}

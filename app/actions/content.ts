@@ -1,0 +1,9 @@
+'use server'
+
+import { getSupabaseUser, supabaseServer } from '@/lib/supabase/server'
+import { revalidatePath } from 'next/cache'
+
+async function getUserId() { return (await getSupabaseUser()).id }
+export async function getContentPosts() { const userId = await getUserId(); const { data, error } = await supabaseServer().from('content_posts').select('*').eq('user_id', userId).order('created_at', { ascending: false }); if (error) throw new Error(error.message); return (data ?? []).map((row) => ({ id: row.id, title: row.title, content: row.content, type: row.type, likes: row.likes ?? 0, comments: row.comments ?? 0, shares: row.shares ?? 0, createdAt: new Date(row.created_at), updatedAt: new Date(row.updated_at) })) }
+export async function createContentPost(input: { title: string; content: string; type: string }) { const userId = await getUserId(); if (!input.title.trim() || !input.content.trim()) throw new Error('Title and content are required'); const now = new Date().toISOString(); const post = { id: crypto.randomUUID(), user_id: userId, title: input.title.trim(), content: input.content.trim(), type: input.type, likes: 0, comments: 0, shares: 0, created_at: now, updated_at: now }; const { error } = await supabaseServer().from('content_posts').insert(post); if (error) throw new Error(error.message); revalidatePath('/dashboard/content'); return { id: post.id, title: post.title, content: post.content, type: post.type, likes: post.likes, comments: post.comments, shares: post.shares, createdAt: new Date(post.created_at), updatedAt: new Date(post.updated_at) } }
+export async function deleteContentPost(id: string) { const userId = await getUserId(); const { error } = await supabaseServer().from('content_posts').delete().eq('id', id).eq('user_id', userId); if (error) throw new Error(error.message); revalidatePath('/dashboard/content') }

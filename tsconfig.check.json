@@ -1,0 +1,6 @@
+{
+  "//": "Type check used by `npm test`. Skips Next's generated .next/ types, which the dev server rewrites while it runs.",
+  "extends": "./tsconfig.json",
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules", ".next"]
+}

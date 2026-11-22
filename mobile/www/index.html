@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>PAPA</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; min-height: 100dvh; display: flex; align-items: center; justify-content: center; font-family: system-ui, sans-serif; background: #fff; color: #111; text-align: center; padding: 24px; box-sizing: border-box; }
+    @media (prefers-color-scheme: dark) { body { background: #000; color: #f5f5f5; } }
+    img { width: 96px; height: 96px; border-radius: 50%; background: #fff; }
+    h1 { font-size: 22px; margin: 16px 0 8px; }
+    p { margin: 0 0 20px; opacity: .75; }
+    button { border: 0; border-radius: 999px; padding: 12px 28px; font-size: 16px; font-weight: 700; background: #1E3FA0; color: #fff; }
+  </style>
+</head>
+<body>
+  <main>
+    <img src="logo.png" alt="">
+    <h1>You're offline</h1>
+    <p>PAPA needs the internet. Check your data or Wi-Fi, then try again.</p>
+    <button onclick="location.reload()">Try again</button>
+  </main>
+</body>
+</html>

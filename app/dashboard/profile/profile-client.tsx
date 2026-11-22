@@ -1,0 +1,9 @@
+'use client'
+import { useState,useTransition } from 'react'
+import { updateProfile } from '@/app/actions/profile'
+import { Button } from '@/components/ui/button'
+import { Card,CardContent,CardHeader,CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+type Profile={id:string;name:string;email:string;role:string|null;phone:string|null;location:string|null;bio:string|null}
+export default function ProfileClient({profile}:{profile:Profile|null}){const [data,setData]=useState({name:profile?.name??'',email:profile?.email??'',role:profile?.role??'Member',phone:profile?.phone??'',location:profile?.location??'',bio:profile?.bio??''});const [pending,startTransition]=useTransition();const save=()=>startTransition(async()=>{const next=await updateProfile(data);if(next)setData({...data,name:next.name,role:next.role??'Member',phone:next.phone??'',location:next.location??'',bio:next.bio??''})});const field=(name:keyof typeof data,label:string)=><Label>{label}<Input disabled={name==='email'} value={data[name]} onChange={e=>setData({...data,[name]:e.target.value})}/></Label>;return <div className="flex max-w-3xl flex-col gap-6"><div><h1 className="text-3xl font-bold">My Profile</h1><p className="text-muted-foreground">Your account details are stored securely in Neon.</p></div><Card><CardHeader><CardTitle>Personal information</CardTitle></CardHeader><CardContent className="grid gap-4 md:grid-cols-2">{field('name','Full name')}{field('email','Email')}{field('phone','Phone')}{field('location','Location')}{field('role','Role')}<Label className="md:col-span-2">Bio<textarea rows={5} className="w-full rounded-md border bg-background p-3" value={data.bio} onChange={e=>setData({...data,bio:e.target.value})}/></Label><Button onClick={save} disabled={pending} className="md:col-span-2">{pending?'Saving…':'Save changes'}</Button></CardContent></Card></div>}

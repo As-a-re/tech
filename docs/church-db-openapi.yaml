@@ -1,0 +1,92 @@
+openapi: 3.1.0
+info:
+  title: Church member database API (used by PAPA)
+  version: 1.0.0
+  description: >
+    What PAPA, the Christ Anointed Church Ghana app, reads from the church's member database.
+    PAPA only reads. See CHURCH_DB_API.md for behaviour and timing.
+servers:
+  - url: https://church-db.example.org/v1
+security:
+  - bearer: []
+paths:
+  /members/{church_id}:
+    get:
+      summary: One member
+      parameters:
+        - name: church_id
+          in: path
+          required: true
+          description: Upper-case, no spaces (PAPA sends it that way)
+          schema: { type: string, example: CAC-000123 }
+      responses:
+        '200':
+          description: The member
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Member' }
+        '401': { description: Bad or missing API key }
+        '403': { description: Key not allowed }
+        '404': { description: No such Church ID }
+  /members/changes:
+    get:
+      summary: Members created or changed after a time (paged)
+      parameters:
+        - name: since
+          in: query
+          required: true
+          description: ISO 8601 UTC time; return members with updated_at > since
+          schema: { type: string, format: date-time }
+        - name: cursor
+          in: query
+          required: false
+          description: next_cursor from the previous page
+          schema: { type: string }
+      responses:
+        '200':
+          description: One page of changes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [members, until]
+                properties:
+                  members:
+                    type: array
+                    items: { $ref: '#/components/schemas/Member' }
+                  next_cursor:
+                    type: [string, 'null']
+                    description: null on the last page
+                  until:
+                    type: string
+                    format: date-time
+                    description: The time this run is complete up to; same on every page of one run. PAPA sends it as `since` next time.
+        '401': { description: Bad or missing API key }
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+  schemas:
+    Member:
+      type: object
+      required: [church_id, full_name, phone, status, assembly, district]
+      properties:
+        church_id: { type: string, example: CAC-000123 }
+        full_name: { type: string, example: Ama Owusu }
+        phone: { type: string, description: Any Ghana format, example: '+233241234567' }
+        status: { type: string, enum: [active, inactive] }
+        date_of_birth: { type: [string, 'null'], format: date, example: '1994-05-17' }
+        assembly:
+          type: object
+          required: [id, name]
+          properties:
+            id: { type: string, example: A-0042 }
+            name: { type: string, example: Bethel Assembly }
+            town: { type: [string, 'null'], example: Madina }
+        district:
+          type: object
+          required: [id, name]
+          properties:
+            id: { type: string, example: D-0007 }
+            name: { type: string, example: Madina District }

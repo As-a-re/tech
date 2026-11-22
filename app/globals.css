@@ -1,0 +1,141 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+/* Christ Anointed Church — traditional colours: red, blue, white */
+:root {
+  --brand-blue: oklch(0.40 0.17 264);   /* ≈ #1E3FA0, logo ring */
+  --brand-red: oklch(0.58 0.24 28);     /* ≈ #E3120B, logo "C" */
+
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.21 0.03 264);
+  --card: oklch(1 0 0);
+  --card-foreground: var(--foreground);
+  --popover: oklch(1 0 0);
+  --popover-foreground: var(--foreground);
+  --primary: var(--brand-blue);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.96 0.012 264);
+  --secondary-foreground: var(--brand-blue);
+  --muted: oklch(0.967 0.006 264);
+  --muted-foreground: oklch(0.50 0.03 264);
+  --accent: oklch(0.955 0.02 264);
+  --accent-foreground: var(--brand-blue);
+  --destructive: var(--brand-red);
+  --destructive-foreground: oklch(0.99 0 0);
+  --border: oklch(0.915 0.01 264);
+  --input: oklch(0.915 0.01 264);
+  --ring: var(--brand-blue);
+  --radius: 0.75rem;
+  --bubble-mine: var(--brand-blue);
+  --bubble-mine-fg: #FFFFFF;
+  --tick-read: #38BDF8;
+  --hero: var(--brand-blue);
+
+  --sidebar: oklch(1 0 0);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-primary: var(--brand-blue);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.96 0.015 264);
+  --sidebar-accent-foreground: var(--brand-blue);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--brand-blue);
+  --chart-1: var(--brand-blue); --chart-2: var(--brand-red); --chart-3: oklch(0.65 0.12 230); --chart-4: oklch(0.7 0.15 150); --chart-5: oklch(0.78 0.14 80);
+}
+
+.dark {
+  /* Pure-black dark theme: every screen is #000000; only hovered/selected items get a slightly lighter black */
+  --brand-blue: #00F0FF;
+  --brand-red: #FF3333;
+  --background: #000000;
+  --foreground: #FFFFFF;
+  --card: #000000;
+  --card-foreground: var(--foreground);
+  --popover: #000000;
+  --popover-foreground: var(--foreground);
+  --primary: #00F0FF;
+  --primary-foreground: #000000;
+  --secondary: #121212;
+  --secondary-foreground: var(--foreground);
+  --muted: #0D0D0D;
+  --muted-foreground: #A3A3A3;
+  --accent: #1A1A1A;
+  --accent-foreground: var(--foreground);
+  --destructive: #FF3333;
+  --destructive-foreground: #FFFFFF;
+  --border: #262626;
+  --input: #2E2E2E;
+  --ring: #00F0FF;
+  --sidebar: #000000;
+  --sidebar-foreground: var(--foreground);
+  --sidebar-primary: #00F0FF;
+  --sidebar-primary-foreground: #000000;
+  --sidebar-accent: #1A1A1A;
+  --sidebar-accent-foreground: var(--foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: #00F0FF;
+  --bubble-mine: #00363A;
+  --bubble-mine-fg: #FFFFFF;
+  --tick-read: #00F0FF;
+  --hero: #000000;
+}
+
+@theme inline {
+  --font-sans: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
+  --color-brand-blue: var(--brand-blue);
+  --color-brand-red: var(--brand-red);
+  --color-bubble-mine: var(--bubble-mine);
+  --color-bubble-mine-fg: var(--bubble-mine-fg);
+  --color-tick-read: var(--tick-read);
+  --color-hero: var(--hero);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-chart-1: var(--chart-1); --color-chart-2: var(--chart-2); --color-chart-3: var(--chart-3); --color-chart-4: var(--chart-4); --color-chart-5: var(--chart-5);
+}
+
+/* Text size (Settings → Display). Everything is sized in rem, so the whole app scales. */
+html[data-text-size='small'] { font-size: 93.75%; }
+html[data-text-size='large'] { font-size: 112.5%; }
+html[data-text-size='xlarge'] { font-size: 125%; }
+
+@layer base {
+  * { @apply border-border outline-ring/50; }
+  body { @apply bg-background text-foreground antialiased; }
+}
+
+/* Live: reactions float up the player */
+@keyframes float {
+  0% { transform: translateY(0) scale(.8); opacity: 0; }
+  15% { opacity: 1; transform: translateY(-20px) scale(1.1); }
+  100% { transform: translateY(-260px) scale(1); opacity: 0; }
+}

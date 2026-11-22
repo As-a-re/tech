@@ -1,0 +1,20 @@
+node_modules
+.next
+out
+.env*
+!.env.example
+*.tsbuildinfo
+next-env.d.ts
+/uploads
+/backups
+
+# Phone app build outputs (the android/ and ios/ projects themselves are kept)
+android/app/build
+android/build
+android/.gradle
+android/local.properties
+ios/App/build
+ios/DerivedData
+ios/App/Pods
+*.keystore
+*.jks

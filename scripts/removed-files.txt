@@ -1,0 +1,8 @@
+# Files that later batches removed or moved. Unzipping a batch can't delete files,
+# so setup.sh deletes these from your project folder (safe if they're already gone).
+components/shell/post-button.tsx
+app/(social)/messages/page.tsx
+scripts/lib/register.ts
+app/(social)/children/page.tsx
+server/demo.ts
+components/shell/demo-banner.tsx
