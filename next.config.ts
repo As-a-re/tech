@@ -2,7 +2,7 @@ import type { NextConfig } from 'next'
 
 const nextConfig: NextConfig = {
   // Media uploads go through server actions (profiles, posts, chats, products)
-  experimental: { serverActions: { bodySizeLimit: '25mb' } },
+  experimental: { serverActions: { bodySizeLimit: '25mb' }, cpus: 4 },
   poweredByHeader: false,
   async headers() {
     return [{
