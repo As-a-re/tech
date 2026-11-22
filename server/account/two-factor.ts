@@ -1,7 +1,7 @@
 import 'server-only'
 import { randomBytes } from 'node:crypto'
-import { verify } from '@node-rs/argon2'
 import { createSupabaseAdminClient } from '@/lib/supabase/admin'
+import { verifySupabaseCredentials } from '@/server/identity/login'
 import { env } from '@/lib/env'
 import { sha256 } from '@/lib/crypto'
 import { open, seal } from '@/lib/secret-box'
@@ -32,9 +32,9 @@ export async function confirmSetup(userId:string, code:string):Promise<string[]|
 }
 export async function disable(userId:string, password:string) {
   const sb = createSupabaseAdminClient()
-  const { data:u, error } = await sb.from('users').select('password_hash').eq('id', userId).maybeSingle()
+  const { data:u, error } = await sb.from('users').select('auth_user_id,phone').eq('id', userId).maybeSingle()
   if (error) throw new Error(`Unable to verify account: ${error.message}`)
-  if (!u || !(await verify(u.password_hash, password).catch(() => false))) return false
+  if (!u?.auth_user_id || (await verifySupabaseCredentials(u.phone, password))?.id !== u.auth_user_id) return false
   const { error: updateError } = await sb.from('users').update({ totp_secret:null, totp_enabled_at:null }).eq('id', userId)
   if (updateError) throw new Error(`Unable to disable two-factor authentication: ${updateError.message}`)
   const { error: deleteError } = await sb.from('backup_codes').delete().eq('user_id', userId)

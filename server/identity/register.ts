@@ -43,9 +43,22 @@ export async function completeRegistration(input: { churchId: string; phone: str
   const assemblyId = await cacheMember(member)
   const { data: reg, error: regError } = await sb.from('church_members').select('grant_tech_admin').eq('church_id', member.churchId).maybeSingle()
   if (regError) throw new Error(`Unable to check registration privileges: ${regError.message}`)
+  const { data: authResult, error: authError } = await sb.auth.admin.createUser({
+    phone: member.phone,
+    password: input.password,
+    phone_confirm: true,
+    user_metadata: { church_id: member.churchId, username },
+  })
+  if (authError) {
+    if (/already|exists|registered/i.test(authError.message)) return { ok: false, error: 'registered' }
+    throw new Error(`Unable to create Supabase Auth account: ${authError.message}`)
+  }
+  if (!authResult.user) throw new Error('Supabase Auth did not return a new user')
+
   const password_hash = await hashPassword(input.password)
-  const { data: user, error } = await sb.from('users').insert({ church_id: member.churchId, username, full_name: member.fullName, phone: member.phone, assembly_id: assemblyId, password_hash, role: reg?.grant_tech_admin ? 'tech_admin' : 'member', locale: input.locale }).select('id').single()
+  const { data: user, error } = await sb.from('users').insert({ auth_user_id: authResult.user.id, church_id: member.churchId, username, full_name: member.fullName, phone: member.phone, assembly_id: assemblyId, password_hash, role: reg?.grant_tech_admin ? 'tech_admin' : 'member', locale: input.locale }).select('id').single()
   if (error) {
+    await sb.auth.admin.deleteUser(authResult.user.id)
     if (error.code === '23505' && error.message.toLowerCase().includes('username')) return { ok: false, error: 'username_taken' }
     if (error.code === '23505') return { ok: false, error: 'registered' }
     throw new Error(`Unable to create account: ${error.message}`)

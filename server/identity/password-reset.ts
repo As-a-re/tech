@@ -3,7 +3,6 @@ import { createSupabaseAdminClient } from '@/lib/supabase/admin'
 import { normaliseChurchId, normalisePhone } from '@/lib/identity/normalise'
 import { passwordProblem } from '@/lib/identity/rules'
 import { checkCode, sendCode } from './codes'
-import { hashPassword } from './register'
 import { hit } from './rate-limit'
 import { audit } from './audit'
 import { destroyAllSessions } from './session'
@@ -28,8 +27,14 @@ export async function finishReset(input: { userId: string | null; phone: string 
   if (!input.userId || !input.phone) return { ok: false, error: 'code_wrong' }
   const r = await checkCode(input.phone, 'reset_password', input.code)
   if (r !== 'ok') return { ok: false, error: r === 'wrong' ? 'code_wrong' : r === 'locked' ? 'code_locked' : 'code_expired' }
-  const { error } = await createSupabaseAdminClient().from('users').update({ password_hash: await hashPassword(input.password), password_changed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', input.userId)
-  if (error) throw new Error(`Unable to reset password: ${error.message}`)
+  const sb = createSupabaseAdminClient()
+  const { data: account, error: accountError } = await sb.from('users').select('auth_user_id').eq('id', input.userId).maybeSingle()
+  if (accountError) throw new Error(`Unable to load account: ${accountError.message}`)
+  if (!account?.auth_user_id) return { ok: false, error: 'code_wrong' }
+  const { error: authError } = await sb.auth.admin.updateUserById(account.auth_user_id, { password: input.password })
+  if (authError) throw new Error(`Unable to reset Supabase Auth password: ${authError.message}`)
+  const { error } = await sb.from('users').update({ password_changed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', input.userId)
+  if (error) throw new Error(`Unable to reset account password: ${error.message}`)
   await destroyAllSessions(input.userId)
   await audit('account.password_reset', { actorId: input.userId, ip: input.ip })
   return { ok: true, userId: input.userId }
