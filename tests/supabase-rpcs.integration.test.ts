@@ -182,4 +182,15 @@ integration('Supabase migration RPC integration (read-only/safe probes)', () => 
     expect(data.data).toHaveProperty('marketOrders')
   })
 
+  it('does not allow product save through a shop the actor does not own', async () => {
+    const result = await client.rpc('papa_market_save_product', {
+      p_user_id: missingId,
+      p_shop_id: missingId,
+      p_product_id: null,
+      p_values: { title: 'Test', category: 'test', condition: 'new', images: [], option_names: [], price_pesewas: 100, status: 'draft' },
+      p_variants: [],
+    })
+    expect(result.error?.message).toContain('shop_not_found')
+  })
+
 })
