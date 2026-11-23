@@ -164,6 +164,25 @@ integration('Supabase migration RPC integration (read-only/safe probes)', () => 
     expect(Array.isArray(reminders.data)).toBe(true)
   })
 
+  it('exposes market catalog and order lifecycle RPCs with safe missing-ID probes', async () => {
+    const [products, categories, cancelled, refunded] = await Promise.all([
+      client.rpc('papa_market_list_products', {
+        p_query: 'no-such-market-integration-item', p_category: null, p_min_pesewas: null, p_max_pesewas: null,
+        p_condition: null, p_in_stock: false, p_deals: false, p_delivery: false, p_district_id: null,
+        p_rating_min: null, p_shop_id: missingId, p_sort: 'best', p_page: 1, p_limit: 5,
+        p_exclude_id: null, p_ids: null, p_since: null,
+      }),
+      client.rpc('papa_market_category_counts'),
+      client.rpc('papa_market_cancel_order', { p_order_id: missingId, p_by: 'system', p_actor_id: null, p_reason: 'integration probe' }),
+      client.rpc('papa_market_apply_refund', { p_order_id: missingId, p_amount: 1, p_fee: 0, p_seller_net: 0 }),
+    ])
+    for (const result of [products, categories, cancelled, refunded]) expect(result.error).toBeNull()
+    expect(products.data).toEqual([])
+    expect(Array.isArray(categories.data)).toBe(true)
+    expect(cancelled.data).toEqual([])
+    expect(refunded.data).toEqual([])
+  })
+
   it('exposes Market admin read RPCs without mutating Market data', async () => {
     const [stats, orders, requests, products, shops, data] = await Promise.all([
       client.rpc('papa_market_admin_stats'),

@@ -6,8 +6,9 @@ import { notify } from '@/server/notifications/notify'
 import { refundPayment } from '@/integrations/payments'
 import { sendSms } from '@/integrations/sms'
 import { ghs } from '@/lib/give/money'
+import { createSupabaseAdminClient } from '@/lib/supabase/admin'
 import { iso, isId, orderEvent, type Who } from './shared'
-import { restock } from './cart'
+import { fireStockAlerts } from './catalog'
 
 export type OrderStatus = (typeof schema.marketOrderStatus.enumValues)[number]
 export const ACTIVE: OrderStatus[] = ['paid', 'accepted', 'packed', 'shipped']
@@ -139,8 +140,14 @@ export async function refundOrder(orderId: string, amountPesewas: number, actorI
   const refunded = o.refundedPesewas + amountPesewas
   const remaining = o.totalPesewas - refunded
   const fee = Math.round((Math.min(o.subtotalPesewas - o.discountPesewas, remaining) * o.feeBps) / 10_000)
-  await db.update(schema.marketOrders).set({ refundedPesewas: refunded, feePesewas: fee, sellerNetPesewas: Math.max(0, remaining - fee - o.riderFeePesewas), ...(remaining === 0 ? { escrow: 'refunded' as const } : {}) })
-    .where(eq(schema.marketOrders.id, orderId))
+  const { data: recorded, error: recordError } = await createSupabaseAdminClient().rpc('papa_market_apply_refund', {
+    p_order_id: orderId,
+    p_amount: amountPesewas,
+    p_fee: fee,
+    p_seller_net: Math.max(0, remaining - fee - o.riderFeePesewas),
+  })
+  if (recordError) throw new Error(`Unable to record market refund: ${recordError.message}`)
+  if (!recorded?.length) return { ok: false, error: 'amount' }
   await orderEvent(orderId, 'refunded', actorId, ghs(amountPesewas))
   const all = await db.execute<{ left: number }>(sql`select coalesce(sum(total_pesewas - refunded_pesewas), 0)::int as left from market_orders where checkout_id = ${o.checkoutId} and paid_at is not null`)
   if (all.rows[0].left === 0) await db.update(schema.payments).set({ status: 'refunded' }).where(eq(schema.payments.id, p.id))
@@ -154,30 +161,36 @@ export async function refundOrder(orderId: string, amountPesewas: number, actorI
 
 /** Cancels a paid order: full refund, stock back, everyone told. */
 async function cancelPaid(orderId: string, by: 'buyer' | 'seller' | 'admin' | 'system', actorId: string | null, reason: string) {
-  const [o] = await db.update(schema.marketOrders).set({ status: 'cancelled', cancelledAt: sql`now()`, cancelReason: reason })
-    .where(and(eq(schema.marketOrders.id, orderId), sql`${schema.marketOrders.status} in ('paid', 'accepted', 'packed', 'shipped')`)).returning()
+  const client = createSupabaseAdminClient()
+  const [{ data: itemRows, error: itemError }, { data: deliveryRows, error: deliveryError }] = await Promise.all([
+    client.from('market_order_items').select('product_id').eq('order_id', orderId),
+    client.from('deliveries').select('rider_id').eq('order_id', orderId).in('status', ['open', 'accepted', 'picked_up']),
+  ])
+  if (itemError) throw new Error(`Unable to load cancellation items: ${itemError.message}`)
+  if (deliveryError) throw new Error(`Unable to load cancellation deliveries: ${deliveryError.message}`)
+  const { data, error } = await client.rpc('papa_market_cancel_order', {
+    p_order_id: orderId, p_by: by, p_actor_id: actorId, p_reason: reason,
+  })
+  if (error) throw new Error(`Unable to cancel market order: ${error.message}`)
+  const o = data?.[0]
   if (!o) return false
-  await orderEvent(orderId, `cancelled_by_${by}`, actorId, reason)
-  // A delivery not yet done is called off (the rider is told)
-  const called = await db.update(schema.deliveries).set({ status: 'cancelled', cancelledAt: sql`now()` })
-    .where(and(eq(schema.deliveries.orderId, orderId), sql`${schema.deliveries.status} in ('open', 'accepted', 'picked_up')`)).returning({ riderId: schema.deliveries.riderId })
-  for (const c of called) if (c.riderId) {
-    const [r] = await db.select({ u: schema.riders.userId }).from(schema.riders).where(eq(schema.riders.id, c.riderId))
-    if (r) await notify(r.u, 'market_delivery', null, null, { marketOrderId: orderId }).catch(() => {})
+  for (const delivery of deliveryRows ?? []) {
+    if (!delivery.rider_id) continue
+    const { data: rider, error: riderError } = await client.from('riders').select('user_id').eq('id', delivery.rider_id).maybeSingle()
+    if (riderError) throw new Error(`Unable to load delivery rider: ${riderError.message}`)
+    if (rider?.user_id) await notify(rider.user_id, 'market_delivery', null, null, { marketOrderId: orderId }).catch(() => {})
   }
-  if (called.length) await db.update(schema.marketOrders).set({ riderFeePesewas: 0 }).where(eq(schema.marketOrders.id, orderId))
-  await restock(orderId)
-  if (o.couponId) await db.execute(sql`update coupons set used_count = greatest(used_count - 1, 0) where id = ${o.couponId}`)
-  await db.execute(sql`update products p set sold_count = greatest(sold_count - i.qty, 0) from (select product_id, sum(qty)::int as qty from market_order_items where order_id = ${orderId} group by 1) i where p.id = i.product_id`)
-  const left = o.totalPesewas - o.refundedPesewas
+  const productIds = new Set((itemRows ?? []).map((item) => item.product_id).filter((id): id is string => typeof id === 'string'))
+  for (const productId of productIds) {
+    await fireStockAlerts(productId).catch(() => {})
+  }
+  const left = o.total_pesewas - o.refunded_pesewas
   if (left > 0) {
-    const r = await refundOrder(orderId, left, actorId, `cancelled (${reason})`)
-    // If the provider refused, the money stays marked as owed: a Tech Admin sees it under Market → Orders
-    if (!r.ok) await orderEvent(orderId, 'refund_pending', null, ghs(left))
+    const refund = await refundOrder(orderId, left, actorId, `cancelled (${reason})`)
+    if (!refund.ok) await orderEvent(orderId, 'refund_pending', null, ghs(left))
   }
-  await db.update(schema.marketOrders).set({ escrow: 'refunded' }).where(and(eq(schema.marketOrders.id, orderId), sql`${schema.marketOrders.refundedPesewas} = ${schema.marketOrders.totalPesewas}`))
-  if (by !== 'buyer' && o.buyerId) await notify(o.buyerId, 'market_order', null, null, { marketOrderId: orderId }).catch(() => {})
-  if (by !== 'seller' && o.sellerId) await notify(o.sellerId, 'market_sale', by === 'buyer' ? o.buyerId : null, null, { marketOrderId: orderId }).catch(() => {})
+  if (by !== 'buyer' && o.buyer_id) await notify(o.buyer_id, 'market_order', null, null, { marketOrderId: orderId }).catch(() => {})
+  if (by !== 'seller' && o.seller_id) await notify(o.seller_id, 'market_sale', by === 'buyer' ? o.buyer_id : null, null, { marketOrderId: orderId }).catch(() => {})
   return true
 }
 
