@@ -174,7 +174,7 @@ integration('Supabase migration RPC integration (read-only/safe probes)', () => 
       }),
       client.rpc('papa_market_category_counts'),
       client.rpc('papa_market_cancel_order', { p_order_id: missingId, p_by: 'system', p_actor_id: null, p_reason: 'integration probe' }),
-      client.rpc('papa_market_apply_refund', { p_order_id: missingId, p_amount: 1, p_fee: 0, p_seller_net: 0 }),
+      client.rpc('papa_market_record_refund', { p_order_id: missingId, p_amount: 1 }),
     ])
     for (const result of [products, categories, cancelled, refunded]) expect(result.error).toBeNull()
     expect(products.data).toEqual([])

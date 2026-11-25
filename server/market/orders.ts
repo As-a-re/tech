@@ -137,14 +137,9 @@ export async function refundOrder(orderId: string, amountPesewas: number, actorI
   if (!p) return { ok: false, error: 'not_paid' }
   const r = await refundPayment(p.reference, amountPesewas, `${o.number}: ${note}`)
   if (!r.ok) return { ok: false, error: 'refund_failed' }
-  const refunded = o.refundedPesewas + amountPesewas
-  const remaining = o.totalPesewas - refunded
-  const fee = Math.round((Math.min(o.subtotalPesewas - o.discountPesewas, remaining) * o.feeBps) / 10_000)
-  const { data: recorded, error: recordError } = await createSupabaseAdminClient().rpc('papa_market_apply_refund', {
+  const { data: recorded, error: recordError } = await createSupabaseAdminClient().rpc('papa_market_record_refund', {
     p_order_id: orderId,
     p_amount: amountPesewas,
-    p_fee: fee,
-    p_seller_net: Math.max(0, remaining - fee - o.riderFeePesewas),
   })
   if (recordError) throw new Error(`Unable to record market refund: ${recordError.message}`)
   if (!recorded?.length) return { ok: false, error: 'amount' }
