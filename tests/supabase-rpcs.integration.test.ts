@@ -164,8 +164,19 @@ integration('Supabase migration RPC integration (read-only/safe probes)', () => 
     expect(Array.isArray(reminders.data)).toBe(true)
   })
 
+  it('exposes cart snapshot and variant validation RPCs with safe missing-ID probes', async () => {
+    const [cart, variant] = await Promise.all([
+      client.rpc('papa_market_cart_snapshot', { p_user_id: missingId }),
+      client.rpc('papa_market_variant_info', { p_variant_id: missingId }),
+    ])
+    expect(cart.error).toBeNull()
+    expect(variant.error).toBeNull()
+    expect(cart.data).toEqual([])
+    expect(variant.data).toEqual([])
+  })
+
   it('exposes market catalog and order lifecycle RPCs with safe missing-ID probes', async () => {
-    const [products, categories, cancelled, refunded] = await Promise.all([
+    const [products, categories, cancelled, refunded, checkout] = await Promise.all([
       client.rpc('papa_market_list_products', {
         p_query: 'no-such-market-integration-item', p_category: null, p_min_pesewas: null, p_max_pesewas: null,
         p_condition: null, p_in_stock: false, p_deals: false, p_delivery: false, p_district_id: null,
@@ -175,12 +186,14 @@ integration('Supabase migration RPC integration (read-only/safe probes)', () => 
       client.rpc('papa_market_category_counts'),
       client.rpc('papa_market_cancel_order', { p_order_id: missingId, p_by: 'system', p_actor_id: null, p_reason: 'integration probe' }),
       client.rpc('papa_market_record_refund', { p_order_id: missingId, p_amount: 1 }),
+      client.rpc('papa_market_set_checkout_paid', { p_checkout_id: missingId, p_ok: false }),
     ])
-    for (const result of [products, categories, cancelled, refunded]) expect(result.error).toBeNull()
+    for (const result of [products, categories, cancelled, refunded, checkout]) expect(result.error).toBeNull()
     expect(products.data).toEqual([])
     expect(Array.isArray(categories.data)).toBe(true)
     expect(cancelled.data).toEqual([])
     expect(refunded.data).toEqual([])
+    expect(checkout.data).toEqual([])
   })
 
   it('exposes Market admin read RPCs without mutating Market data', async () => {
