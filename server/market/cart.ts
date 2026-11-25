@@ -1,6 +1,4 @@
 import 'server-only'
-import { and, eq, sql } from 'drizzle-orm'
-import { db, schema } from '@/db'
 import { createSupabaseAdminClient } from '@/lib/supabase/admin'
 import { hit } from '@/server/identity/rate-limit'
 import { notify } from '@/server/notifications/notify'
@@ -126,14 +124,20 @@ export type CouponError = 'coupon_invalid' | 'coupon_expired' | 'coupon_min' | '
 export async function checkCoupon(shopId: string, code: string, subtotal: number, buyerId: string): Promise<{ ok: true; id: string; code: string; discount: number } | { ok: false; error: CouponError }> {
   const c = code.trim().toUpperCase()
   if (!/^[A-Z0-9-]{3,20}$/.test(c)) return { ok: false, error: 'coupon_invalid' }
-  const [k] = await db.select().from(schema.coupons).where(and(eq(schema.coupons.shopId, shopId), eq(schema.coupons.code, c), eq(schema.coupons.active, true)))
+  const client = createSupabaseAdminClient()
+  const { data: k, error } = await client.from('coupons')
+    .select('id,code,kind,value,min_spend_pesewas,starts_at,ends_at,max_uses,used_count')
+    .eq('shop_id', shopId).eq('code', c).eq('active', true).maybeSingle()
+  if (error) throw new Error(`Unable to check market coupon: ${error.message}`)
   if (!k) return { ok: false, error: 'coupon_invalid' }
   const now = Date.now()
-  if ((k.startsAt && k.startsAt.getTime() > now) || (k.endsAt && k.endsAt.getTime() < now)) return { ok: false, error: 'coupon_expired' }
-  if (subtotal < k.minSpendPesewas) return { ok: false, error: 'coupon_min' }
-  if (k.maxUses != null && k.usedCount >= k.maxUses) return { ok: false, error: 'coupon_used_up' }
-  const used = await db.$count(schema.marketOrders, and(eq(schema.marketOrders.buyerId, buyerId), eq(schema.marketOrders.couponId, k.id), sql`${schema.marketOrders.status} not in ('pending_payment', 'cancelled')`))
-  if (used > 0) return { ok: false, error: 'coupon_used' }
+  if ((k.starts_at && new Date(k.starts_at).getTime() > now) || (k.ends_at && new Date(k.ends_at).getTime() < now)) return { ok: false, error: 'coupon_expired' }
+  if (subtotal < k.min_spend_pesewas) return { ok: false, error: 'coupon_min' }
+  if (k.max_uses != null && k.used_count >= k.max_uses) return { ok: false, error: 'coupon_used_up' }
+  const { count: used, error: usedError } = await client.from('market_orders').select('id', { count: 'exact', head: true })
+    .eq('buyer_id', buyerId).eq('coupon_id', k.id).not('status', 'in', '(pending_payment,cancelled)')
+  if (usedError) throw new Error(`Unable to check coupon usage: ${usedError.message}`)
+  if ((used ?? 0) > 0) return { ok: false, error: 'coupon_used' }
   const discount = k.kind === 'percent' ? Math.floor((subtotal * Math.min(90, k.value)) / 100) : Math.min(k.value, subtotal)
   return { ok: true, id: k.id, code: k.code, discount }
 }
@@ -176,11 +180,15 @@ export async function quoteCheckout(user: Who, choices: CheckoutChoice[]) {
 
 /** The address from the member's last delivery (or their name and phone), to fill the form. */
 export async function lastAddress(userId: string): Promise<Address> {
-  const [o] = await db.select().from(schema.marketOrders).where(and(eq(schema.marketOrders.buyerId, userId), eq(schema.marketOrders.fulfilment, 'delivery')))
-    .orderBy(sql`${schema.marketOrders.createdAt} desc`).limit(1)
-  if (o) return { name: o.recipientName ?? '', phone: o.phone ? formatPhone(o.phone) : '', town: o.town ?? '', address: o.address ?? '', landmark: o.landmark }
-  const [u] = await db.select({ name: schema.users.fullName, phone: schema.users.phone }).from(schema.users).where(eq(schema.users.id, userId))
-  return { name: u?.name ?? '', phone: u?.phone ? formatPhone(u.phone) : '', town: '', address: '', landmark: '' }
+  const client = createSupabaseAdminClient()
+  const { data: order, error: orderError } = await client.from('market_orders')
+    .select('recipient_name,phone,town,address,landmark').eq('buyer_id', userId).eq('fulfilment', 'delivery')
+    .order('created_at', { ascending: false }).limit(1).maybeSingle()
+  if (orderError) throw new Error(`Unable to load previous delivery address: ${orderError.message}`)
+  if (order) return { name: order.recipient_name ?? '', phone: order.phone ? formatPhone(order.phone) : '', town: order.town ?? '', address: order.address ?? '', landmark: order.landmark }
+  const { data: user, error: userError } = await client.from('users').select('full_name,phone').eq('id', userId).maybeSingle()
+  if (userError) throw new Error(`Unable to load buyer details: ${userError.message}`)
+  return { name: user?.full_name ?? '', phone: user?.phone ? formatPhone(user.phone) : '', town: '', address: '', landmark: '' }
 }
 
 /**
@@ -277,25 +285,22 @@ export async function placeOrder(user: Who, choices: CheckoutChoice[], address: 
 
 /** Stock and coupons held by the buyer's unpaid checkouts go back (the payment is checked with the provider first). */
 export async function releasePendingCheckouts(buyerId: string) {
-  const r = await db.execute<{ reference: string; checkout: string; provider: string }>(sql`select p.reference, p.market_checkout_id as checkout, p.provider from payments p
-    where p.user_id = ${buyerId} and p.purpose = 'order' and p.status = 'pending' and p.market_checkout_id is not null`)
-  for (const p of r.rows) {
-    if (p.provider === 'paystack') {
+  const client = createSupabaseAdminClient()
+  const { data: pending, error } = await client.from('payments').select('reference,market_checkout_id,provider')
+    .eq('user_id', buyerId).eq('purpose', 'order').eq('status', 'pending').not('market_checkout_id', 'is', null)
+  if (error) throw new Error(`Unable to load pending market checkouts: ${error.message}`)
+  for (const payment of pending ?? []) {
+    if (!payment.market_checkout_id) continue
+    if (payment.provider === 'paystack') {
       const { confirmPayment } = await import('@/server/payments/payments')
-      const v = await confirmPayment(p.reference)
-      if (v?.status !== 'pending') continue
+      const verified = await confirmPayment(payment.reference)
+      if (verified?.status !== 'pending') continue
     }
-    const gone = await db.update(schema.payments).set({ status: 'abandoned' }).where(and(eq(schema.payments.reference, p.reference), eq(schema.payments.status, 'pending'))).returning()
-    if (gone.length) await checkoutPaid(p.checkout, false)
+    const { data: abandoned, error: updateError } = await client.from('payments').update({ status: 'abandoned' })
+      .eq('reference', payment.reference).eq('status', 'pending').select('reference')
+    if (updateError) throw new Error(`Unable to release pending market payment: ${updateError.message}`)
+    if (abandoned?.length) await checkoutPaid(payment.market_checkout_id, false)
   }
-}
-
-/** Puts an order's items back in stock (and tells members waiting for them). */
-export async function restock(orderId: string) {
-  const items = await db.select({ variantId: schema.marketOrderItems.variantId, productId: schema.marketOrderItems.productId, qty: schema.marketOrderItems.qty })
-    .from(schema.marketOrderItems).where(eq(schema.marketOrderItems.orderId, orderId))
-  for (const i of items) if (i.variantId) await db.execute(sql`update product_variants set stock = stock + ${i.qty} where id = ${i.variantId}`)
-  for (const pid of new Set(items.map((i) => i.productId).filter(Boolean) as string[])) await fireStockAlerts(pid).catch(() => {})
 }
 
 /**
@@ -337,11 +342,19 @@ export async function checkoutPaid(checkoutId: string, ok: boolean) {
   }
   if (!paid.length) {
     // Paid for orders that were already released (e.g. the buyer started a new checkout): give the money back
-    const [p] = await db.select().from(schema.payments).where(and(eq(schema.payments.marketCheckoutId, checkoutId), eq(schema.payments.status, 'success')))
-    const open = await db.$count(schema.marketOrders, and(eq(schema.marketOrders.checkoutId, checkoutId), sql`${schema.marketOrders.status} <> 'cancelled'`))
-    if (p && !open) {
-      const r = await refundPayment(p.reference, p.amountPesewas, 'Order was no longer reserved')
-      if (r.ok) await db.update(schema.payments).set({ status: 'refunded' }).where(eq(schema.payments.id, p.id))
+    const client = createSupabaseAdminClient()
+    const { data: payment, error: paymentError } = await client.from('payments').select('id,reference,amount_pesewas')
+      .eq('market_checkout_id', checkoutId).eq('status', 'success').maybeSingle()
+    if (paymentError) throw new Error(`Unable to load market payment: ${paymentError.message}`)
+    const { count: open, error: ordersError } = await client.from('market_orders').select('id', { count: 'exact', head: true })
+      .eq('checkout_id', checkoutId).neq('status', 'cancelled')
+    if (ordersError) throw new Error(`Unable to check market checkout orders: ${ordersError.message}`)
+    if (payment && !open) {
+      const r = await refundPayment(payment.reference, payment.amount_pesewas, 'Order was no longer reserved')
+      if (r.ok) {
+        const { error: updateError } = await client.from('payments').update({ status: 'refunded' }).eq('id', payment.id)
+        if (updateError) throw new Error(`Unable to update market payment: ${updateError.message}`)
+      }
     }
     return
   }
@@ -350,24 +363,32 @@ export async function checkoutPaid(checkoutId: string, ok: boolean) {
     if (o.buyerId) await notify(o.buyerId, 'market_order', null, null, { marketOrderId: o.id }).catch(() => {})
     if (o.sellerId) {
       await notify(o.sellerId, 'market_sale', o.buyerId, null, { marketOrderId: o.id }).catch(() => {})
-      const [s] = await db.select({ phone: schema.users.phone }).from(schema.users).where(eq(schema.users.id, o.sellerId))
-      if (s?.phone) await sendSms(s.phone, `PAPA Market: New order ${o.number} (${ghs(o.subtotalPesewas)}). Open PAPA to accept it within 3 days.`).catch(() => {})
+      const { data: seller, error: sellerError } = await createSupabaseAdminClient().from('users').select('phone').eq('id', o.sellerId).maybeSingle()
+      if (sellerError) throw new Error(`Unable to load seller contact: ${sellerError.message}`)
+      if (seller?.phone) await sendSms(seller.phone, `PAPA Market: New order ${o.number} (${ghs(o.subtotalPesewas)}). Open PAPA to accept it within 3 days.`).catch(() => {})
     }
   }
   if (buyerId) {
-    const [b] = await db.select({ phone: schema.users.phone }).from(schema.users).where(eq(schema.users.id, buyerId))
+    const { data: buyer, error: buyerError } = await createSupabaseAdminClient().from('users').select('phone').eq('id', buyerId).maybeSingle()
+    if (buyerError) throw new Error(`Unable to load buyer contact: ${buyerError.message}`)
     const total = paid.reduce((a, o) => a + o.totalPesewas, 0)
-    if (b?.phone) await sendSms(b.phone, `PAPA Market: Payment of ${ghs(total)} received for ${paid.map((o) => o.number).join(', ')}. The money is held safely until you receive your items.`).catch(() => {})
+    if (buyer?.phone) await sendSms(buyer.phone, `PAPA Market: Payment of ${ghs(total)} received for ${paid.map((o) => o.number).join(', ')}. The money is held safely until you receive your items.`).catch(() => {})
   }
 }
 
 /** Order confirmation page: the orders of one checkout (the buyer's own). */
 export async function checkoutSummary(userId: string, checkoutId: string) {
   if (!isId(checkoutId)) return null
-  const orders = await db.select({ id: schema.marketOrders.id, number: schema.marketOrders.number, shopName: schema.marketOrders.shopName, status: schema.marketOrders.status,
-    fulfilment: schema.marketOrders.fulfilment, totalPesewas: schema.marketOrders.totalPesewas, createdAt: schema.marketOrders.createdAt })
-    .from(schema.marketOrders).where(and(eq(schema.marketOrders.checkoutId, checkoutId), eq(schema.marketOrders.buyerId, userId))).orderBy(schema.marketOrders.shopName)
-  if (!orders.length) return null
-  const [p] = await db.select({ reference: schema.payments.reference, status: schema.payments.status }).from(schema.payments).where(eq(schema.payments.marketCheckoutId, checkoutId)).orderBy(sql`${schema.payments.createdAt} desc`).limit(1)
-  return { orders: orders.map((o) => ({ ...o, createdAt: iso(o.createdAt)! })), reference: p?.reference ?? null, paymentStatus: p?.status ?? null, sandbox: paymentProvider() === 'sandbox' }
+  const client = createSupabaseAdminClient()
+  const { data: orders, error: ordersError } = await client.from('market_orders')
+    .select('id,number,shop_name,status,fulfilment,total_pesewas,created_at').eq('checkout_id', checkoutId).eq('buyer_id', userId).order('shop_name')
+  if (ordersError) throw new Error(`Unable to load market checkout summary: ${ordersError.message}`)
+  if (!orders?.length) return null
+  const { data: payment, error: paymentError } = await client.from('payments').select('reference,status')
+    .eq('market_checkout_id', checkoutId).order('created_at', { ascending: false }).limit(1).maybeSingle()
+  if (paymentError) throw new Error(`Unable to load market payment status: ${paymentError.message}`)
+  return {
+    orders: orders.map((o) => ({ id: o.id, number: o.number, shopName: o.shop_name, status: o.status, fulfilment: o.fulfilment, totalPesewas: o.total_pesewas, createdAt: iso(o.created_at)! })),
+    reference: payment?.reference ?? null, paymentStatus: payment?.status ?? null, sandbox: paymentProvider() === 'sandbox',
+  }
 }
