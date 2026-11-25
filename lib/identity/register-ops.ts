@@ -1,7 +1,7 @@
 /** Church register CSV parsing and Supabase operations shared by admin tooling and CLI scripts. */
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { isGhanaMobile, normaliseChurchId, normalisePhone, slugify } from '../lib/identity/normalise'
-import { parseCsv } from '../lib/csv'
+import { isGhanaMobile, normaliseChurchId, normalisePhone, slugify } from './normalise'
+import { parseCsv } from '../csv'
 type DB=SupabaseClient
 export async function ensureDistrict(db:DB,name:string){const clean=name.trim().replace(/\s+/g,' '),slug=slugify(clean);const{data,error}=await db.from('districts').upsert({name:clean,slug},{onConflict:'slug'}).select('id,slug').single();if(error)throw new Error(`Unable to create/update district: ${error.message}`);return data}
 export async function ensureAssembly(db:DB,districtName:string,assemblyName:string,town:string|null){const d=await ensureDistrict(db,districtName),name=assemblyName.trim().replace(/\s+/g,' '),slug=slugify(`${name}-${d.slug}`);const{data,error}=await db.from('assemblies').upsert({district_id:d.id,name,town,slug},{onConflict:'slug'}).select('id').single();if(error)throw new Error(`Unable to create/update assembly: ${error.message}`);return data.id}

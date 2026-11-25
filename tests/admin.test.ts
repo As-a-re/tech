@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { eq, like } from 'drizzle-orm'
 import { db, pool, schema } from '@/db'
-import { parseRegisterCsv } from '@/db/register-ops'
+import { parseRegisterCsv } from '@/lib/identity/register-ops'
 import * as register from '@/server/admin/register'
 import * as structure from '@/server/admin/structure'
 import * as accounts from '@/server/admin/accounts'

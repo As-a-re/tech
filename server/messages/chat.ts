@@ -1,7 +1,6 @@
 import 'server-only'
 import { livekitEnabled } from '@/integrations/livekit'
-import { and, asc, desc, eq, gt, inArray, isNull, lt, sql } from 'drizzle-orm'
-import { db, schema } from '@/db'
+import { createSupabaseAdminClient } from '@/lib/supabase/admin'
 import { env } from '@/lib/env'
 import { hit } from '@/server/identity/rate-limit'
 import { containsBannedWord } from '@/server/posts/compose'
@@ -16,6 +15,22 @@ export const UNSEND_HOURS = 24
 export const REACTIONS = ['❤️', '🙏🏾', '🙌', '😂', '😮', '👍'] as const
 const PAGE = 40
 const ONLINE_MS = 3 * 60_000
+const db = () => createSupabaseAdminClient()
+const fail = (error: { message: string } | null) => { if (error) throw new Error(error.message) }
+
+type MessageRow = {
+  id: string
+  conversation_id: string
+  sender_id: string | null
+  kind: string
+  body: string
+  reply_to_id: string | null
+  forwarded: boolean
+  client_id: string | null
+  created_at: string
+  edited_at: string | null
+  deleted_at: string | null
+}
 
 type AttachmentKind = 'image' | 'video' | 'audio' | 'file'
 export type AttachmentInput = { kind: AttachmentKind; url: string; name?: string | null; size?: number | null; mime?: string | null; width?: number | null; height?: number | null; duration?: number | null }
@@ -39,25 +54,17 @@ const OWN_FILE = (userId: string) => new RegExp(`^/media/(chat|posts)/${userId}/
 /* ───────────── Conversations ───────────── */
 
 export async function existingDirectChat(a: string, b: string) {
-  const [c] = await db.select({ id: schema.conversations.id }).from(schema.conversations).where(eq(schema.conversations.directKey, [a, b].sort().join(':')))
-  return c?.id ?? null
+  const { data, error } = await db().from('conversations').select('id').eq('direct_key', [a, b].sort().join(':')).maybeSingle()
+  fail(error)
+  return data?.id ?? null
 }
 
 /** The one direct chat between two members (created on first use). */
 export async function directChat(me: string, other: string) {
-  const key = [me, other].sort().join(':')
-  const [found] = await db.select({ id: schema.conversations.id }).from(schema.conversations).where(eq(schema.conversations.directKey, key))
-  if (found) {
-    // Coming back to a chat you had left / archived brings it back
-    await db.update(schema.conversationMembers).set({ leftAt: null }).where(and(eq(schema.conversationMembers.conversationId, found.id), eq(schema.conversationMembers.userId, me)))
-    return found.id
-  }
-  return db.transaction(async (tx) => {
-    const [c] = await tx.insert(schema.conversations).values({ kind: 'direct', directKey: key, createdBy: me }).onConflictDoNothing().returning({ id: schema.conversations.id })
-    if (!c) return (await tx.select({ id: schema.conversations.id }).from(schema.conversations).where(eq(schema.conversations.directKey, key)))[0].id
-    await tx.insert(schema.conversationMembers).values([{ conversationId: c.id, userId: me }, { conversationId: c.id, userId: other }])
-    return c.id
-  })
+  const { data, error } = await db().rpc('papa_direct_chat', { p_me: me, p_other: other })
+  fail(error)
+  if (!data) throw new Error('Unable to create direct conversation')
+  return data as string
 }
 
 export type ChatFilter = 'all' | 'unread' | 'archived'
@@ -69,37 +76,16 @@ export type ChatListItem = {
 
 /** The member's chats: pinned first, then newest activity. */
 export async function listChats(userId: string, filter: ChatFilter = 'all', q?: string): Promise<ChatListItem[]> {
-  const term = q?.trim() ? `%${q.trim().replace(/[%_]/g, '')}%` : null
-  const r = await db.execute<{
-    id: string; kind: 'direct' | 'group'; title: string | null; avatar_url: string | null; last_at: Date | null; pinned_at: Date | null; archived: boolean; muted: boolean
-    o_id: string | null; o_username: string | null; o_name: string | null; o_avatar: string | null; o_verified: boolean | null; o_seen: Date | null; o_show_seen: boolean | null
-    o_read: Date | null; o_delivered: Date | null; o_receipts: boolean | null; my_receipts: boolean
-    m_body: string | null; m_kind: string | null; m_sender: string | null; m_sender_name: string | null; m_deleted: boolean | null; m_at: Date | null; unread: number
-  }>(sql`
-    select c.id, c.kind, c.title, c.avatar_url, c.last_message_at as last_at, me.pinned_at, me.archived,
-      (me.muted_until is not null and me.muted_until > now()) as muted,
-      o.id as o_id, o.username as o_username, o.full_name as o_name, o.avatar_url as o_avatar, o.verified_at is not null as o_verified,
-      o.last_seen_at as o_seen, coalesce(op.show_last_seen, true) as o_show_seen, om.last_read_at as o_read, om.last_delivered_at as o_delivered,
-      coalesce(op.read_receipts, true) as o_receipts, coalesce(mp.read_receipts, true) as my_receipts,
-      lm.body as m_body, lm.kind as m_kind, lm.sender_id as m_sender, ls.full_name as m_sender_name, lm.deleted_at is not null as m_deleted, lm.created_at as m_at,
-      (select count(*)::int from messages x where x.conversation_id = c.id and x.sender_id is distinct from ${userId} and x.deleted_at is null and x.kind <> 'system'
-         and x.created_at > coalesce(me.last_read_at, me.joined_at - interval '1 second') and x.created_at > coalesce(me.cleared_at, 'epoch')) as unread
-    from conversation_members me
-    join conversations c on c.id = me.conversation_id
-    left join conversation_members om on c.kind = 'direct' and om.conversation_id = c.id and om.user_id <> ${userId}
-    left join users o on o.id = om.user_id
-    left join user_preferences op on op.user_id = o.id
-    left join user_preferences mp on mp.user_id = ${userId}
-    left join lateral (select * from messages m where m.conversation_id = c.id and m.created_at > coalesce(me.cleared_at, 'epoch')
-      and not exists (select 1 from message_hidden h where h.message_id = m.id and h.user_id = ${userId}) order by m.created_at desc limit 1) lm on true
-    left join users ls on ls.id = lm.sender_id
-    where me.user_id = ${userId} and me.left_at is null and c.deleted_at is null and (c.kind = 'group' or om.user_id is not null) and (c.last_message_at is not null or c.kind = 'group' or c.created_by = ${userId})
-      and ${filter === 'archived' ? sql`me.archived` : sql`not me.archived`}
-      ${term ? sql`and (coalesce(c.title, o.full_name) ilike ${term} or o.username ilike ${term})` : sql``}
-    order by me.pinned_at desc nulls last, coalesce(c.last_message_at, c.created_at) desc
-    limit 200`)
+  const { data, error } = await db().rpc('papa_list_chats', { p_user_id: userId, p_filter: filter, p_query: q?.trim() || null })
+  fail(error)
+  const rows = (data ?? []) as {
+    id: string; kind: 'direct' | 'group'; title: string | null; avatar_url: string | null; last_at: string | null; pinned_at: string | null; archived: boolean; muted: boolean
+    o_id: string | null; o_username: string | null; o_name: string | null; o_avatar: string | null; o_verified: boolean | null; o_seen: string | null; o_show_seen: boolean | null
+    o_read: string | null; o_delivered: string | null; o_receipts: boolean | null; my_receipts: boolean
+    m_body: string | null; m_kind: string | null; m_sender: string | null; m_sender_name: string | null; m_deleted: boolean | null; m_at: string | null; unread: number
+  }[]
   const now = Date.now()
-  const items = r.rows.map((x): ChatListItem => {
+  const items = rows.map((x): ChatListItem => {
     const mine = x.m_sender === userId
     const receipts = x.o_receipts !== false && x.my_receipts
     const status: MessageView['status'] = !mine || !x.m_at ? null
@@ -116,12 +102,9 @@ export async function listChats(userId: string, filter: ChatFilter = 'all', q?: 
 
 /** Chats with something unread (for the badge on the Messages icon). Muted chats don't count. */
 export async function unreadChats(userId: string) {
-  const r = await db.execute<{ n: number }>(sql`
-    select count(*)::int as n from conversation_members me where me.user_id = ${userId} and me.left_at is null and not me.archived
-      and (me.muted_until is null or me.muted_until < now())
-      and exists (select 1 from messages x where x.conversation_id = me.conversation_id and x.sender_id is distinct from ${userId} and x.deleted_at is null and x.kind <> 'system'
-        and x.created_at > coalesce(me.last_read_at, me.joined_at - interval '1 second') and x.created_at > coalesce(me.cleared_at, 'epoch'))`)
-  return r.rows[0]?.n ?? 0
+  const { data, error } = await db().rpc('papa_unread_chats', { p_user_id: userId })
+  fail(error)
+  return Number(data ?? 0)
 }
 
 export type ChatHeader = {
@@ -138,32 +121,41 @@ export type ChatHeader = {
 export async function chatHeader(conversationId: string, userId: string): Promise<ChatHeader | null> {
   const me = await membership(conversationId, userId)
   if (!me) return null
-  const [c] = await db.select().from(schema.conversations).where(eq(schema.conversations.id, conversationId))
-  const members = await db.$count(schema.conversationMembers, and(eq(schema.conversationMembers.conversationId, conversationId), isNull(schema.conversationMembers.leftAt)))
+  const client = db()
+  const { data: c, error: conversationError } = await client.from('conversations').select('*').eq('id', conversationId).maybeSingle()
+  fail(conversationError)
+  if (!c) return null
+  const { count, error: countError } = await client.from('conversation_members').select('user_id', { count: 'exact', head: true }).eq('conversation_id', conversationId).is('left_at', null)
+  fail(countError)
+  const members = count ?? 0
   let other: ChatHeader['other'] = null
   let blockedReason: ChatHeader['blockedReason'] = null
   if (c.kind === 'direct') {
-    const [o] = await db.select({ u: schema.users, show: schema.userPreferences.showLastSeen }).from(schema.conversationMembers)
-      .innerJoin(schema.users, eq(schema.users.id, schema.conversationMembers.userId)).leftJoin(schema.userPreferences, eq(schema.userPreferences.userId, schema.users.id))
-      .where(and(eq(schema.conversationMembers.conversationId, conversationId), sql`${schema.conversationMembers.userId} <> ${userId}`))
-    if (o) {
-      const [mine] = await db.select({ show: schema.userPreferences.showLastSeen }).from(schema.userPreferences).where(eq(schema.userPreferences.userId, userId))
-      // Like WhatsApp: if you hide your last seen, you can't see others' either
-      const visible = (o.show ?? true) && (mine?.show ?? true)
-      const seen = visible ? o.u.lastSeenAt : null
-      other = { id: o.u.id, username: o.u.username, fullName: o.u.fullName, avatarUrl: o.u.avatarUrl, verified: !!o.u.verifiedAt, bio: o.u.bio,
-        online: !!seen && Date.now() - seen.getTime() < ONLINE_MS, lastSeenAt: seen?.toISOString() ?? null }
-      const can = await canMessage(userId, o.u.id, conversationId)
-      blockedReason = can.ok ? null : ('reason' in can && can.reason === 'self' ? null : ('reason' in can && can.reason !== 'self' ? can.reason : 'not_allowed'))
+    const { data: otherMember, error: otherMemberError } = await client.from('conversation_members').select('user_id').eq('conversation_id', conversationId).neq('user_id', userId).maybeSingle()
+    fail(otherMemberError)
+    if (otherMember) {
+      const [{ data: profile, error: profileError }, { data: otherPrefs, error: otherPrefsError }, { data: myPrefs, error: myPrefsError }] = await Promise.all([
+        client.from('users').select('id,username,full_name,avatar_url,verified_at,last_seen_at,bio').eq('id', otherMember.user_id).maybeSingle(),
+        client.from('user_preferences').select('show_last_seen').eq('user_id', otherMember.user_id).maybeSingle(),
+        client.from('user_preferences').select('show_last_seen').eq('user_id', userId).maybeSingle(),
+      ])
+      fail(profileError); fail(otherPrefsError); fail(myPrefsError)
+      if (profile) {
+        const visible = (otherPrefs?.show_last_seen ?? true) && (myPrefs?.show_last_seen ?? true)
+        const seen = visible ? profile.last_seen_at : null
+        other = { id: profile.id, username: profile.username, fullName: profile.full_name, avatarUrl: profile.avatar_url, verified: !!profile.verified_at, bio: profile.bio,
+          online: !!seen && Date.now() - new Date(seen).getTime() < ONLINE_MS, lastSeenAt: seen ?? null }
+        const can = await canMessage(userId, profile.id, conversationId)
+        blockedReason = can.ok ? null : ('reason' in can && can.reason === 'self' ? null : ('reason' in can && can.reason !== 'self' ? can.reason : 'not_allowed'))
+      }
     }
   }
   let names: Record<string, string> = {}
   if (c.kind === 'group') {
-    if (c.onlyAdminsSend && me.role !== 'admin') blockedReason = 'admins_only'
-    const people = await db.select({ id: schema.users.id, n: schema.users.fullName }).from(schema.conversationMembers)
-      .innerJoin(schema.users, eq(schema.users.id, schema.conversationMembers.userId))
-      .where(and(eq(schema.conversationMembers.conversationId, conversationId), isNull(schema.conversationMembers.leftAt))).limit(1100)
-    names = Object.fromEntries(people.map((p) => [p.id, p.n.split(' ')[0]]))
+    if (c.only_admins_send && me.role !== 'admin') blockedReason = 'admins_only'
+    const { data: people, error: peopleError } = await client.from('conversation_members').select('user:users!inner(id,full_name)').eq('conversation_id', conversationId).is('left_at', null).limit(1100)
+    fail(peopleError)
+    names = Object.fromEntries((people ?? []).map((person: any) => [person.user.id, person.user.full_name.split(' ')[0]]))
   }
   const { canCall, openCallIn } = await import('@/server/calls/calls')
   const callBlock = c.kind === 'direct' && other ? await canCall(userId, other.id) : { ok: true as const }
@@ -179,77 +171,91 @@ export async function chatHeader(conversationId: string, userId: string): Promis
 export async function setChatOption(userId: string, conversationId: string, opt: { muted?: boolean; pinned?: boolean; archived?: boolean; cleared?: boolean }) {
   const me = await membership(conversationId, userId)
   if (!me) return false
-  await db.update(schema.conversationMembers).set({
-    ...(opt.muted !== undefined ? { mutedUntil: opt.muted ? new Date('2999-01-01') : null } : {}),
-    ...(opt.pinned !== undefined ? { pinnedAt: opt.pinned ? new Date() : null } : {}),
-    ...(opt.archived !== undefined ? { archivedAt: opt.archived ? new Date() : null } : {}),
-    ...(opt.cleared ? { clearedAt: new Date() } : {}),
-  }).where(and(eq(schema.conversationMembers.conversationId, conversationId), eq(schema.conversationMembers.userId, userId)))
+  const patch = {
+    ...(opt.muted !== undefined ? { muted_until: opt.muted ? '2999-01-01T00:00:00.000Z' : null } : {}),
+    ...(opt.pinned !== undefined ? { pinned_at: opt.pinned ? new Date().toISOString() : null } : {}),
+    ...(opt.archived !== undefined ? { archived: opt.archived } : {}),
+    ...(opt.cleared ? { cleared_at: new Date().toISOString() } : {}),
+  }
+  const { error } = await db().from('conversation_members').update(patch).eq('conversation_id', conversationId).eq('user_id', userId)
+  fail(error)
   return true
 }
 
 /* ───────────── Messages ───────────── */
 
-async function hydrate(rows: (typeof schema.messages.$inferSelect)[], userId: string, conversationId: string): Promise<MessageView[]> {
+async function hydrate(rows: MessageRow[], userId: string, conversationId: string): Promise<MessageView[]> {
   if (!rows.length) return []
-  const ids = rows.map((r) => r.id)
-  const senders = [...new Set(rows.map((r) => r.senderId).filter(Boolean))] as string[]
-  const replyIds = [...new Set(rows.map((r) => r.replyToId).filter(Boolean))] as string[]
-  const [people, atts, reacts, replies, others, myPrefs] = await Promise.all([
-    senders.length ? db.select({ id: schema.users.id, username: schema.users.username, fullName: schema.users.fullName, avatarUrl: schema.users.avatarUrl, verified: sql<boolean>`${schema.users.verifiedAt} is not null` })
-      .from(schema.users).where(inArray(schema.users.id, senders)) : [],
-    db.select().from(schema.messageAttachments).where(inArray(schema.messageAttachments.messageId, ids)),
-    db.select().from(schema.messageReactions).where(inArray(schema.messageReactions.messageId, ids)),
-    replyIds.length ? db.select({ id: schema.messages.id, body: schema.messages.body, kind: schema.messages.kind, deleted: sql<boolean>`${schema.messages.deletedAt} is not null`, name: schema.users.fullName })
-      .from(schema.messages).leftJoin(schema.users, eq(schema.users.id, schema.messages.senderId)).where(inArray(schema.messages.id, replyIds)) : [],
-    db.select({ read: schema.conversationMembers.lastReadAt, delivered: schema.conversationMembers.lastDeliveredAt, receipts: schema.userPreferences.readReceipts })
-      .from(schema.conversationMembers).leftJoin(schema.userPreferences, eq(schema.userPreferences.userId, schema.conversationMembers.userId))
-      .where(and(eq(schema.conversationMembers.conversationId, conversationId), sql`${schema.conversationMembers.userId} <> ${userId}`, isNull(schema.conversationMembers.leftAt))),
-    db.select({ receipts: schema.userPreferences.readReceipts }).from(schema.userPreferences).where(eq(schema.userPreferences.userId, userId)),
+  const client = db()
+  const ids = rows.map((row) => row.id)
+  const senders = [...new Set(rows.map((row) => row.sender_id).filter(Boolean))] as string[]
+  const replyIds = [...new Set(rows.map((row) => row.reply_to_id).filter(Boolean))] as string[]
+  const [peopleResult, attachmentsResult, reactionsResult, repliesResult, membersResult, myPrefsResult] = await Promise.all([
+    senders.length ? client.from('users').select('id,username,full_name,avatar_url,verified_at').in('id', senders) : Promise.resolve({ data: [], error: null }),
+    client.from('message_attachments').select('message_id,kind,url,name,size,mime,width,height,duration').in('message_id', ids),
+    client.from('message_reactions').select('message_id,user_id,emoji').in('message_id', ids),
+    replyIds.length ? client.from('messages').select('id,body,kind,deleted_at,sender_id').in('id', replyIds) : Promise.resolve({ data: [], error: null }),
+    client.from('conversation_members').select('last_read_at,last_delivered_at,user_id').eq('conversation_id', conversationId).neq('user_id', userId).is('left_at', null),
+    client.from('user_preferences').select('read_receipts').eq('user_id', userId).maybeSingle(),
   ])
-  const receipts = (myPrefs[0]?.receipts ?? true) && others.every((o) => o.receipts !== false)
-  const byPerson = new Map<string, (typeof people)[number]>(people.map((p) => [p.id, p] as [string, (typeof people)[number]]))
-  return rows.map((m) => {
-    const mine = m.senderId === userId
-    const deleted = !!m.deletedAt
-    const status: MessageView['status'] = !mine || m.kind === 'system' ? null
-      : others.length && receipts && others.every((o) => o.read && o.read >= m.createdAt) ? 'read'
-        : others.length && others.every((o) => o.delivered && o.delivered >= m.createdAt) ? 'delivered' : 'sent'
-    const reply = m.replyToId ? replies.find((x) => x.id === m.replyToId) : null
+  for (const result of [peopleResult, attachmentsResult, reactionsResult, repliesResult, membersResult, myPrefsResult]) fail(result.error)
+  const people = (peopleResult.data ?? []).map((person: any) => ({ id: person.id, username: person.username, fullName: person.full_name, avatarUrl: person.avatar_url, verified: !!person.verified_at }))
+  const attachments = attachmentsResult.data ?? []
+  const reactions = reactionsResult.data ?? []
+  const replyRows = repliesResult.data ?? []
+  const replySenders = [...new Set(replyRows.map((reply: any) => reply.sender_id).filter(Boolean))] as string[]
+  const { data: replyPeople, error: replyPeopleError } = replySenders.length ? await client.from('users').select('id,full_name').in('id', replySenders) : { data: [], error: null }
+  fail(replyPeopleError)
+  const replyNames = new Map((replyPeople ?? []).map((person: any) => [person.id, person.full_name]))
+  const memberIds = (membersResult.data ?? []).map((member: any) => member.user_id)
+  const { data: memberPrefs, error: memberPrefsError } = memberIds.length ? await client.from('user_preferences').select('user_id,read_receipts').in('user_id', memberIds) : { data: [], error: null }
+  fail(memberPrefsError)
+  const preferenceByUser = new Map((memberPrefs ?? []).map((prefs: any) => [prefs.user_id, prefs.read_receipts]))
+  const others = (membersResult.data ?? []).map((member: any) => ({
+    read: member.last_read_at ? new Date(member.last_read_at) : null,
+    delivered: member.last_delivered_at ? new Date(member.last_delivered_at) : null,
+    receipts: preferenceByUser.get(member.user_id),
+  }))
+  const receipts = (myPrefsResult.data?.read_receipts ?? true) && others.every((other) => other.receipts !== false)
+  const byPerson = new Map(people.map((person: any) => [person.id, person]))
+  return rows.map((message) => {
+    const createdAt = new Date(message.created_at)
+    const mine = message.sender_id === userId
+    const deleted = !!message.deleted_at
+    const status: MessageView['status'] = !mine || message.kind === 'system' ? null
+      : others.length && receipts && others.every((other) => other.read && other.read >= createdAt) ? 'read'
+        : others.length && others.every((other) => other.delivered && other.delivered >= createdAt) ? 'delivered' : 'sent'
+    const reply = message.reply_to_id ? replyRows.find((row: any) => row.id === message.reply_to_id) : null
     const counts = new Map<string, { count: number; mine: boolean }>()
-    for (const r of reacts.filter((r) => r.messageId === m.id)) {
-      const c = counts.get(r.emoji) ?? { count: 0, mine: false }
-      counts.set(r.emoji, { count: c.count + 1, mine: c.mine || r.userId === userId })
+    for (const reaction of reactions.filter((row: any) => row.message_id === message.id)) {
+      const count = counts.get(reaction.emoji) ?? { count: 0, mine: false }
+      counts.set(reaction.emoji, { count: count.count + 1, mine: count.mine || reaction.user_id === userId })
     }
     return {
-      id: m.id, conversationId: m.conversationId, kind: m.kind, body: deleted ? '' : m.body, createdAt: m.createdAt.toISOString(), editedAt: m.editedAt?.toISOString() ?? null,
-      deleted, forwarded: m.forwarded, sender: m.senderId ? byPerson.get(m.senderId) ?? null : null, mine,
-      replyTo: reply ? { id: reply.id, senderName: reply.name ?? '', body: reply.deleted ? '' : reply.body.slice(0, 160), kind: reply.kind, deleted: reply.deleted } : null,
-      attachments: deleted ? [] : atts.filter((a) => a.messageId === m.id).map((a) => ({ kind: a.kind as AttachmentKind, url: a.url, name: a.name, size: a.size, mime: a.mime, width: a.width, height: a.height, duration: a.duration })),
-      reactions: deleted ? [] : [...counts].map(([emoji, c]) => ({ emoji, ...c })),
+      id: message.id, conversationId: message.conversation_id, kind: message.kind, body: deleted ? '' : message.body, createdAt: createdAt.toISOString(), editedAt: message.edited_at ? new Date(message.edited_at).toISOString() : null,
+      deleted, forwarded: message.forwarded, sender: message.sender_id ? byPerson.get(message.sender_id) ?? null : null, mine,
+      replyTo: reply ? { id: reply.id, senderName: replyNames.get(reply.sender_id) ?? '', body: reply.deleted_at ? '' : reply.body.slice(0, 160), kind: reply.kind, deleted: !!reply.deleted_at } : null,
+      attachments: deleted ? [] : attachments.filter((attachment: any) => attachment.message_id === message.id).map((attachment: any) => ({ kind: attachment.kind as AttachmentKind, url: attachment.url, name: attachment.name, size: attachment.size, mime: attachment.mime, width: attachment.width, height: attachment.height, duration: attachment.duration })),
+      reactions: deleted ? [] : [...counts].map(([emoji, count]) => ({ emoji, ...count })),
       status,
     }
   })
 }
 
-const visibleTo = (userId: string, me: { clearedAt: Date | null; joinedAt: Date }) => and(
-  gt(schema.messages.createdAt, me.clearedAt ?? new Date(0)),
-  sql`${schema.messages.createdAt} >= ${me.joinedAt.toISOString()}::timestamptz - interval '1 second'`,
-  sql`not exists (select 1 from message_hidden h where h.message_id = ${schema.messages.id} and h.user_id = ${userId})`)
-
 /** Newest messages (oldest first in the result), or older ones before a message, or newer ones after one (for live updates). */
 export async function listMessages(conversationId: string, userId: string, opts: { before?: string; after?: string } = {}) {
-  const me = await membership(conversationId, userId)
-  if (!me) return null
-  const m = schema.messages
-  const where = [eq(m.conversationId, conversationId), visibleTo(userId, me)]
-  // Compare in the database (microsecond times), with the id as a tie-breaker
-  const at = (id: string) => sql`(select x.created_at, x.id from messages x where x.id = ${id} and x.conversation_id = ${conversationId})`
-  if (opts.after && /^[0-9a-f-]{36}$/.test(opts.after)) where.push(sql`(${m.createdAt}, ${m.id}) > ${at(opts.after)}`)
-  if (opts.before && /^[0-9a-f-]{36}$/.test(opts.before)) where.push(sql`(${m.createdAt}, ${m.id}) < ${at(opts.before)}`)
-  const rows = opts.after
-    ? await db.select().from(m).where(and(...where)).orderBy(asc(m.createdAt), asc(m.id)).limit(200)
-    : (await db.select().from(m).where(and(...where)).orderBy(desc(m.createdAt), desc(m.id)).limit(PAGE + 1)).reverse()
+  if (!(await membership(conversationId, userId))) return null
+  const validId = (id?: string) => id && /^[0-9a-f-]{36}$/i.test(id) ? id : null
+  const { data, error } = await db().rpc('papa_list_message_rows', {
+    p_conversation_id: conversationId,
+    p_user_id: userId,
+    p_before: validId(opts.before),
+    p_after: validId(opts.after),
+  })
+  fail(error)
+  let rows = (data ?? []) as MessageRow[]
+  if (opts.after && validId(opts.after)) rows = rows.slice(0, 200)
+  else rows = rows.reverse()
   const hasMore = !opts.after && rows.length > PAGE
   const page = hasMore ? rows.slice(1) : rows
   return { items: await hydrate(page, userId, conversationId), hasMore }
@@ -259,13 +265,15 @@ export async function listMessages(conversationId: string, userId: string, opts:
 export async function refreshMessages(conversationId: string, userId: string, ids: string[]) {
   const me = await membership(conversationId, userId)
   if (!me || !ids.length) return []
-  const rows = await db.select().from(schema.messages).where(and(eq(schema.messages.conversationId, conversationId), inArray(schema.messages.id, ids.slice(0, 200))))
-  return hydrate(rows, userId, conversationId)
+  const { data, error } = await db().from('messages').select('id,conversation_id,sender_id,kind,body,reply_to_id,forwarded,client_id,created_at,edited_at,deleted_at').eq('conversation_id', conversationId).in('id', ids.slice(0, 200))
+  fail(error)
+  return hydrate((data ?? []) as MessageRow[], userId, conversationId)
 }
 
 async function membersOf(conversationId: string) {
-  return db.select({ userId: schema.conversationMembers.userId, mutedUntil: schema.conversationMembers.mutedUntil }).from(schema.conversationMembers)
-    .where(and(eq(schema.conversationMembers.conversationId, conversationId), isNull(schema.conversationMembers.leftAt)))
+  const { data, error } = await db().from('conversation_members').select('user_id,muted_until').eq('conversation_id', conversationId).is('left_at', null)
+  fail(error)
+  return (data ?? []).map((member) => ({ userId: member.user_id, mutedUntil: member.muted_until ? new Date(member.muted_until) : null }))
 }
 
 export async function tellMembers(conversationId: string, except: string | null, kind: 'message' | 'read' | 'typing') {
@@ -280,39 +288,47 @@ export async function sendMessage(senderId: string, conversationId: string, inpu
   if (!body && !atts.length) return { ok: false, error: 'empty' }
   if (body.length > MESSAGE_MAX) return { ok: false, error: 'too_long' }
   if (atts.length > 10 || atts.some((a) => !OWN_FILE(senderId).test(a.url) || !['image', 'video', 'audio', 'file'].includes(a.kind))) return { ok: false, error: 'attachments' }
-  const [c] = await db.select({ kind: schema.conversations.kind, onlyAdmins: schema.conversations.onlyAdminsSend }).from(schema.conversations).where(eq(schema.conversations.id, conversationId))
-  if (c.kind === 'group' && c.onlyAdmins && me.role !== 'admin') return { ok: false, error: 'admins_only' }
-  if (c.kind === 'direct') {
-    const [o] = await db.select({ u: schema.conversationMembers.userId }).from(schema.conversationMembers)
-      .where(and(eq(schema.conversationMembers.conversationId, conversationId), sql`${schema.conversationMembers.userId} <> ${senderId}`))
-    const can = await canMessage(senderId, o.u, conversationId)
+  const { data: conversation, error: conversationError } = await db().from('conversations').select('kind,only_admins_send').eq('id', conversationId).maybeSingle()
+  fail(conversationError)
+  if (!conversation) return { ok: false, error: 'not_member' }
+  if (conversation.kind === 'group' && conversation.only_admins_send && me.role !== 'admin') return { ok: false, error: 'admins_only' }
+  if (conversation.kind === 'direct') {
+    const { data: other, error: otherError } = await db().from('conversation_members').select('user_id').eq('conversation_id', conversationId).neq('user_id', senderId).maybeSingle()
+    fail(otherError)
+    if (!other) return { ok: false, error: 'not_member' }
+    const can = await canMessage(senderId, other.user_id, conversationId)
     if (!can.ok) return { ok: false, error: 'reason' in can && can.reason !== 'self' ? can.reason : 'not_member' }
   }
   if (input.replyToId) {
-    const [r] = await db.select({ c: schema.messages.conversationId }).from(schema.messages).where(eq(schema.messages.id, input.replyToId))
-    if (r?.c !== conversationId) return { ok: false, error: 'reply' }
+    const { data: reply, error: replyError } = await db().from('messages').select('conversation_id').eq('id', input.replyToId).maybeSingle()
+    fail(replyError)
+    if (reply?.conversation_id !== conversationId) return { ok: false, error: 'reply' }
   }
   if (body && await containsBannedWord(body)) return { ok: false, error: 'banned_words' }
   if (input.clientId) {
-    const [dup] = await db.select().from(schema.messages).where(and(eq(schema.messages.senderId, senderId), eq(schema.messages.clientId, input.clientId)))
-    if (dup) return { ok: true, message: (await hydrate([dup], senderId, conversationId))[0] }
+    const { data: duplicate, error: duplicateError } = await db().from('messages').select('id,conversation_id,sender_id,kind,body,reply_to_id,forwarded,client_id,created_at,edited_at,deleted_at').eq('sender_id', senderId).eq('client_id', input.clientId).maybeSingle()
+    fail(duplicateError)
+    if (duplicate) return { ok: true, message: (await hydrate([duplicate as MessageRow], senderId, conversationId))[0] }
   }
   if (!(await hit(`msg:${senderId}`, 120, 60))) return { ok: false, error: 'rate_limited' }
-  const kind = atts.length ? (atts[0].kind === 'file' ? 'file' : atts[0].kind) : 'text'
-  const row = await db.transaction(async (tx) => {
-    const [m] = await tx.insert(schema.messages).values({
-      conversationId, senderId, kind, body, replyToId: input.replyToId ?? null, forwarded: !!input.forwarded, clientId: input.clientId?.slice(0, 64) ?? null,
-    }).returning()
-    if (atts.length) await tx.insert(schema.messageAttachments).values(atts.map((a) => ({
-      messageId: m.id, kind: a.kind, url: a.url, name: a.name?.slice(0, 200) ?? null, size: a.size ?? null, mime: a.mime ?? null,
-      width: a.width ?? null, height: a.height ?? null, duration: a.duration ? Math.round(a.duration) : null,
-    })))
-    await tx.update(schema.conversations).set({ lastMessageAt: m.createdAt }).where(eq(schema.conversations.id, conversationId))
-    // Sending reads everything before it, and brings an archived chat back for everyone
-    await tx.update(schema.conversationMembers).set({ lastReadAt: m.createdAt, lastDeliveredAt: m.createdAt }).where(and(eq(schema.conversationMembers.conversationId, conversationId), eq(schema.conversationMembers.userId, senderId)))
-    await tx.update(schema.conversationMembers).set({ archived: false }).where(and(eq(schema.conversationMembers.conversationId, conversationId), isNull(schema.conversationMembers.leftAt)))
-    return m
+  const kind = atts.length ? atts[0].kind : 'text'
+  const { data, error } = await db().rpc('papa_send_message', {
+    p_conversation_id: conversationId,
+    p_sender_id: senderId,
+    p_kind: kind,
+    p_body: body,
+    p_reply_to_id: input.replyToId ?? null,
+    p_forwarded: !!input.forwarded,
+    p_client_id: input.clientId?.slice(0, 64) ?? null,
+    p_attachments: atts.map((attachment) => ({
+      kind: attachment.kind, url: attachment.url, name: attachment.name?.slice(0, 200) ?? null, size: attachment.size ?? null,
+      mime: attachment.mime ?? null, width: attachment.width ?? null, height: attachment.height ?? null,
+      duration: attachment.duration ? Math.round(attachment.duration) : null,
+    })),
   })
+  fail(error)
+  const row = ((data ?? []) as MessageRow[])[0]
+  if (!row) throw new Error('Message could not be sent')
   await tellMembers(conversationId, senderId, 'message')
   void pushNewMessage(conversationId, senderId, body, kind).catch((e) => console.error('push failed', e))
   return { ok: true, message: (await hydrate([row], senderId, conversationId))[0] }
@@ -321,37 +337,54 @@ export async function sendMessage(senderId: string, conversationId: string, inpu
 const PREVIEW: Record<string, string> = { image: '📷 Photo', video: '🎥 Video', audio: '🎤 Voice message', file: '📄 Document' }
 
 async function pushNewMessage(conversationId: string, senderId: string, body: string, kind: string) {
-  const [c] = await db.select({ kind: schema.conversations.kind, title: schema.conversations.title }).from(schema.conversations).where(eq(schema.conversations.id, conversationId))
-  const [s] = await db.select({ n: schema.users.fullName }).from(schema.users).where(eq(schema.users.id, senderId))
-  for (const m of await membersOf(conversationId)) {
-    if (m.userId === senderId || (m.mutedUntil && m.mutedUntil.getTime() > Date.now())) continue
-    if (!(await getPrefs(m.userId)).message.push) continue
-    const subs = await db.select().from(schema.pushSubscriptions).where(eq(schema.pushSubscriptions.userId, m.userId))
-    for (const sub of subs) {
+  const client = db()
+  const { data: conversation, error: conversationError } = await client.from('conversations').select('kind,title').eq('id', conversationId).single()
+  fail(conversationError)
+  const { data: sender, error: senderError } = await client.from('users').select('full_name').eq('id', senderId).single()
+  fail(senderError)
+  for (const member of await membersOf(conversationId)) {
+    if (member.userId === senderId || (member.mutedUntil && member.mutedUntil.getTime() > Date.now())) continue
+    if (!(await getPrefs(member.userId)).message.push) continue
+    const { data: subscriptions, error } = await client.from('push_subscriptions').select('id,endpoint,p256dh,auth').eq('user_id', member.userId)
+    fail(error)
+    for (const subscription of subscriptions ?? []) {
       const text = body || PREVIEW[kind] || ''
-      const r = await sendPush(sub, { title: c.kind === 'group' ? `${c.title} · ${s?.n}` : s?.n ?? 'PAPA', body: text.slice(0, 120), url: `${env.appUrl}/messages/${conversationId}`, tag: `chat:${conversationId}` })
-      if (r === 'gone') await db.delete(schema.pushSubscriptions).where(eq(schema.pushSubscriptions.id, sub.id))
+      const result = await sendPush({ endpoint: subscription.endpoint, p256dh: subscription.p256dh, auth: subscription.auth }, { title: conversation.kind === 'group' ? `${conversation.title} · ${sender.full_name}` : sender.full_name ?? 'PAPA', body: text.slice(0, 120), url: `${env.appUrl}/messages/${conversationId}`, tag: `chat:${conversationId}` })
+      if (result === 'gone') {
+        const { error: deleteError } = await client.from('push_subscriptions').delete().eq('id', subscription.id)
+        fail(deleteError)
+      }
     }
   }
 }
 
 /** Opening a chat marks it read (the sender sees blue ticks if both have read receipts on). */
 export async function markRead(conversationId: string, userId: string) {
-  const r = await db.update(schema.conversationMembers).set({ lastReadAt: sql`now()`, lastDeliveredAt: sql`now()` })
-    .where(and(eq(schema.conversationMembers.conversationId, conversationId), eq(schema.conversationMembers.userId, userId), isNull(schema.conversationMembers.leftAt)))
-    .returning({ c: schema.conversationMembers.conversationId })
-  if (r.length) await tellMembers(conversationId, userId, 'read')
-  return r.length > 0
+  const now = new Date().toISOString()
+  const { data, error } = await db().from('conversation_members').update({ last_read_at: now, last_delivered_at: now })
+    .eq('conversation_id', conversationId).eq('user_id', userId).is('left_at', null).select('conversation_id')
+  fail(error)
+  if (data?.length) await tellMembers(conversationId, userId, 'read')
+  return !!data?.length
 }
 
 /** The member's app received new messages (double grey ticks for the senders). */
 export async function markDelivered(userId: string) {
-  const r = await db.execute<{ conversation_id: string }>(sql`
-    update conversation_members me set last_delivered_at = now() where me.user_id = ${userId} and me.left_at is null
-      and exists (select 1 from messages x where x.conversation_id = me.conversation_id and x.sender_id is distinct from ${userId}
-        and x.created_at > coalesce(me.last_delivered_at, 'epoch'))
-    returning conversation_id`)
-  for (const row of r.rows) await tellMembers(row.conversation_id, userId, 'read')
+  const client = db()
+  const { data: memberships, error: membershipError } = await client.from('conversation_members')
+    .select('conversation_id,last_delivered_at').eq('user_id', userId).is('left_at', null)
+  fail(membershipError)
+  for (const member of memberships ?? []) {
+    let query = client.from('messages').select('id').eq('conversation_id', member.conversation_id).neq('sender_id', userId).limit(1)
+    if (member.last_delivered_at) query = query.gt('created_at', member.last_delivered_at)
+    const { data: pending, error } = await query
+    fail(error)
+    if (!pending?.length) continue
+    const { error: updateError } = await client.from('conversation_members')
+      .update({ last_delivered_at: new Date().toISOString() }).eq('conversation_id', member.conversation_id).eq('user_id', userId)
+    fail(updateError)
+    await tellMembers(member.conversation_id, userId, 'read')
+  }
 }
 
 export async function typing(conversationId: string, userId: string) {
@@ -362,86 +395,128 @@ export async function typing(conversationId: string, userId: string) {
 export async function editMessage(userId: string, id: string, body: string) {
   const text = body.trim()
   if (!text || text.length > MESSAGE_MAX) return { ok: false as const, error: 'empty' as const }
-  const r = await db.update(schema.messages).set({ body: text, editedAt: sql`now()` }).where(and(
-    eq(schema.messages.id, id), eq(schema.messages.senderId, userId), isNull(schema.messages.deletedAt),
-    sql`${schema.messages.createdAt} > now() - make_interval(mins => ${EDIT_MINUTES})`, sql`${schema.messages.kind} <> 'system'`))
-    .returning({ c: schema.messages.conversationId })
-  if (!r.length) return { ok: false as const, error: 'edit_window' as const }
-  await tellMembers(r[0].c, null, 'message')
+  const cutoff = new Date(Date.now() - EDIT_MINUTES * 60_000).toISOString()
+  const { data, error } = await db().from('messages').update({ body: text, edited_at: new Date().toISOString() })
+    .eq('id', id).eq('sender_id', userId).is('deleted_at', null).neq('kind', 'system').gt('created_at', cutoff).select('conversation_id')
+  fail(error)
+  if (!data?.length) return { ok: false as const, error: 'edit_window' as const }
+  await tellMembers(data[0].conversation_id, null, 'message')
   return { ok: true as const }
 }
 
 /** Delete for everyone: your own message, within 24 hours. */
 export async function unsend(userId: string, id: string) {
-  const r = await db.update(schema.messages).set({ deletedAt: sql`now()` }).where(and(
-    eq(schema.messages.id, id), eq(schema.messages.senderId, userId), isNull(schema.messages.deletedAt),
-    sql`${schema.messages.createdAt} > now() - make_interval(hours => ${UNSEND_HOURS})`)).returning({ c: schema.messages.conversationId })
-  if (!r.length) return false
-  await db.delete(schema.messageReactions).where(eq(schema.messageReactions.messageId, id))
-  await tellMembers(r[0].c, null, 'message')
+  const cutoff = new Date(Date.now() - UNSEND_HOURS * 60 * 60_000).toISOString()
+  const { data, error } = await db().from('messages').update({ deleted_at: new Date().toISOString() })
+    .eq('id', id).eq('sender_id', userId).is('deleted_at', null).gt('created_at', cutoff).select('conversation_id')
+  fail(error)
+  if (!data?.length) return false
+  const { error: reactionError } = await db().from('message_reactions').delete().eq('message_id', id)
+  fail(reactionError)
+  await tellMembers(data[0].conversation_id, null, 'message')
   return true
 }
 
 /** Delete for me: hides it from your own view only. */
 export async function hideForMe(userId: string, id: string) {
-  const [m] = await db.select({ c: schema.messages.conversationId }).from(schema.messages).where(eq(schema.messages.id, id))
-  if (!m || !(await membership(m.c, userId))) return false
-  await db.insert(schema.messageHidden).values({ messageId: id, userId }).onConflictDoNothing()
+  const { data: message, error } = await db().from('messages').select('conversation_id').eq('id', id).maybeSingle()
+  fail(error)
+  if (!message || !(await membership(message.conversation_id, userId))) return false
+  const { error: hiddenError } = await db().from('message_hidden').upsert({ message_id: id, user_id: userId }, { onConflict: 'message_id,user_id', ignoreDuplicates: true })
+  fail(hiddenError)
   return true
 }
 
 export async function react(userId: string, id: string, emoji: string | null) {
   if (emoji && !(REACTIONS as readonly string[]).includes(emoji)) return false
-  const [m] = await db.select({ c: schema.messages.conversationId, deleted: schema.messages.deletedAt }).from(schema.messages).where(eq(schema.messages.id, id))
-  if (!m || m.deleted || !(await membership(m.c, userId))) return false
-  if (emoji) await db.insert(schema.messageReactions).values({ messageId: id, userId, emoji }).onConflictDoUpdate({ target: [schema.messageReactions.messageId, schema.messageReactions.userId], set: { emoji, createdAt: sql`now()` } })
-  else await db.delete(schema.messageReactions).where(and(eq(schema.messageReactions.messageId, id), eq(schema.messageReactions.userId, userId)))
-  await tellMembers(m.c, null, 'read')
+  const { data: message, error } = await db().from('messages').select('conversation_id,deleted_at').eq('id', id).maybeSingle()
+  fail(error)
+  if (!message || message.deleted_at || !(await membership(message.conversation_id, userId))) return false
+  if (emoji) {
+    const { error: reactionError } = await db().from('message_reactions').upsert({ message_id: id, user_id: userId, emoji, created_at: new Date().toISOString() }, { onConflict: 'message_id,user_id' })
+    fail(reactionError)
+  } else {
+    const { error: reactionError } = await db().from('message_reactions').delete().eq('message_id', id).eq('user_id', userId)
+    fail(reactionError)
+  }
+  await tellMembers(message.conversation_id, null, 'read')
   return true
 }
 
 /** Forward a message (text and files) to other chats you're in. */
 export async function forward(userId: string, id: string, conversationIds: string[]) {
-  const [m] = await db.select().from(schema.messages).where(and(eq(schema.messages.id, id), isNull(schema.messages.deletedAt)))
-  if (!m || !(await membership(m.conversationId, userId))) return 0
-  const atts = await db.select().from(schema.messageAttachments).where(eq(schema.messageAttachments.messageId, id))
+  const { data: message, error } = await db().from('messages').select('id,conversation_id,sender_id,kind,body,reply_to_id,forwarded,client_id,created_at,edited_at,deleted_at').eq('id', id).is('deleted_at', null).maybeSingle()
+  fail(error)
+  if (!message || !(await membership(message.conversation_id, userId))) return 0
+  const { data: attachments, error: attachmentsError } = await db().from('message_attachments').select('kind,url,name,size,mime,width,height,duration').eq('message_id', id)
+  fail(attachmentsError)
   let sent = 0
-  for (const c of conversationIds.slice(0, 5)) {
-    // Forwarded files keep their original address; the new chat's members get access through the new message
-    const r = await sendForwarded(userId, c, m.body, atts)
-    if (r) sent++
+  for (const conversationId of conversationIds.slice(0, 5)) {
+    const result = await sendForwarded(userId, conversationId, message.body, attachments ?? [])
+    if (result) sent++
   }
   return sent
 }
 
-async function sendForwarded(userId: string, conversationId: string, body: string, atts: (typeof schema.messageAttachments.$inferSelect)[]) {
+async function sendForwarded(userId: string, conversationId: string, body: string, attachments: AttachmentInput[]) {
   const me = await membership(conversationId, userId)
   if (!me) return false
-  const [c] = await db.select({ kind: schema.conversations.kind, onlyAdmins: schema.conversations.onlyAdminsSend }).from(schema.conversations).where(eq(schema.conversations.id, conversationId))
-  if (c.kind === 'group' && c.onlyAdmins && me.role !== 'admin') return false
-  if (c.kind === 'direct') {
-    const [o] = await db.select({ u: schema.conversationMembers.userId }).from(schema.conversationMembers)
-      .where(and(eq(schema.conversationMembers.conversationId, conversationId), sql`${schema.conversationMembers.userId} <> ${userId}`))
-    if (!(await canMessage(userId, o.u, conversationId)).ok) return false
+  const { data: conversation, error } = await db().from('conversations').select('kind,only_admins_send').eq('id', conversationId).maybeSingle()
+  fail(error)
+  if (!conversation) return false
+  if (conversation.kind === 'group' && conversation.only_admins_send && me.role !== 'admin') return false
+  if (conversation.kind === 'direct') {
+    const { data: other, error: otherError } = await db().from('conversation_members').select('user_id').eq('conversation_id', conversationId).neq('user_id', userId).maybeSingle()
+    fail(otherError)
+    if (!other || !(await canMessage(userId, other.user_id, conversationId)).ok) return false
   }
-  const [m] = await db.insert(schema.messages).values({ conversationId, senderId: userId, kind: atts.length ? atts[0].kind : 'text', body, forwarded: true }).returning()
-  if (atts.length) await db.insert(schema.messageAttachments).values(atts.map(({ id: _id, messageId: _m, ...a }) => ({ ...a, messageId: m.id })))
-  await db.update(schema.conversations).set({ lastMessageAt: m.createdAt }).where(eq(schema.conversations.id, conversationId))
+  const { error: sendError } = await db().rpc('papa_send_message', {
+    p_conversation_id: conversationId, p_sender_id: userId, p_kind: attachments.length ? attachments[0].kind : 'text', p_body: body,
+    p_reply_to_id: null, p_forwarded: true, p_client_id: null, p_attachments: attachments,
+  })
+  fail(sendError)
   await tellMembers(conversationId, userId, 'message')
   return true
 }
 
 /** Search the text of your chats. */
 export async function searchMessages(userId: string, q: string) {
-  const term = q.trim()
+  const term = q.trim().replace(/[%_]/g, '')
   if (term.length < 2) return []
-  const r = await db.execute<{ id: string; conversation_id: string; body: string; created_at: Date; sender: string | null; title: string | null; kind: string; other: string | null }>(sql`
-    select m.id, m.conversation_id, m.body, m.created_at, s.full_name as sender, c.title, c.kind,
-      (select u.full_name from conversation_members x join users u on u.id = x.user_id where c.kind = 'direct' and x.conversation_id = c.id and x.user_id <> ${userId}) as other
-    from messages m join conversation_members me on me.conversation_id = m.conversation_id and me.user_id = ${userId} and me.left_at is null
-    join conversations c on c.id = m.conversation_id left join users s on s.id = m.sender_id
-    where m.deleted_at is null and m.kind not in ('system', 'call') and m.body ilike ${`%${term.replace(/[%_]/g, '')}%`} and m.created_at > coalesce(me.cleared_at, 'epoch') and m.created_at >= me.joined_at - interval '1 second'
-      and not exists (select 1 from message_hidden h where h.message_id = m.id and h.user_id = ${userId})
-    order by m.created_at desc limit 50`)
-  return r.rows.map((x) => ({ id: x.id, conversationId: x.conversation_id, body: x.body, at: new Date(x.created_at).toISOString(), sender: x.sender, title: x.kind === 'direct' ? x.other ?? '—' : x.title ?? '—' }))
+  const client = db()
+  const { data: memberships, error: membershipError } = await client.from('conversation_members').select('conversation_id,cleared_at,joined_at').eq('user_id', userId).is('left_at', null)
+  fail(membershipError)
+  if (!memberships?.length) return []
+  const membershipByConversation = new Map(memberships.map((member) => [member.conversation_id, member]))
+  const { data: candidates, error: searchError } = await client.from('messages')
+    .select('id,conversation_id,body,created_at,sender_id').in('conversation_id', memberships.map((member) => member.conversation_id))
+    .is('deleted_at', null).neq('kind', 'system').neq('kind', 'call').ilike('body', `%${term}%`)
+    .order('created_at', { ascending: false }).limit(1000)
+  fail(searchError)
+  if (!candidates?.length) return []
+  const visible = candidates.filter((message) => {
+    const membership = membershipByConversation.get(message.conversation_id)
+    const created = new Date(message.created_at).getTime()
+    return membership && created > new Date(membership.cleared_at ?? 0).getTime() && created >= new Date(membership.joined_at).getTime() - 1000
+  })
+  const visibleIds = visible.map((message) => message.id)
+  const { data: hidden, error: hiddenError } = visibleIds.length ? await client.from('message_hidden').select('message_id').eq('user_id', userId).in('message_id', visibleIds) : { data: [], error: null }
+  fail(hiddenError)
+  const hiddenIds = new Set((hidden ?? []).map((row) => row.message_id))
+  const results = visible.filter((message) => !hiddenIds.has(message.id)).slice(0, 50)
+  const conversationIds = [...new Set(results.map((message) => message.conversation_id))]
+  const senderIds = [...new Set(results.map((message) => message.sender_id).filter(Boolean))] as string[]
+  const [{ data: conversations, error: conversationsError }, { data: senders, error: sendersError }, { data: others, error: othersError }] = await Promise.all([
+    client.from('conversations').select('id,title,kind').in('id', conversationIds),
+    senderIds.length ? client.from('users').select('id,full_name').in('id', senderIds) : Promise.resolve({ data: [], error: null }),
+    client.from('conversation_members').select('conversation_id,user:users!inner(full_name)').in('conversation_id', conversationIds).neq('user_id', userId),
+  ])
+  fail(conversationsError); fail(sendersError); fail(othersError)
+  const conversationById = new Map((conversations ?? []).map((conversation) => [conversation.id, conversation]))
+  const senderById = new Map((senders ?? []).map((sender) => [sender.id, sender.full_name]))
+  const otherByConversation = new Map((others ?? []).map((row: any) => [row.conversation_id, row.user.full_name]))
+  return results.map((message) => {
+    const conversation = conversationById.get(message.conversation_id)
+    return { id: message.id, conversationId: message.conversation_id, body: message.body, at: new Date(message.created_at).toISOString(), sender: senderById.get(message.sender_id) ?? null, title: conversation?.kind === 'direct' ? otherByConversation.get(message.conversation_id) ?? '—' : conversation?.title ?? '—' }
+  })
 }

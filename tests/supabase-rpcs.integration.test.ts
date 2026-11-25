@@ -164,6 +164,38 @@ integration('Supabase migration RPC integration (read-only/safe probes)', () => 
     expect(Array.isArray(reminders.data)).toBe(true)
   })
 
+  it('exposes cart snapshot and variant validation RPCs with safe missing-ID probes', async () => {
+    const [cart, variant] = await Promise.all([
+      client.rpc('papa_market_cart_snapshot', { p_user_id: missingId }),
+      client.rpc('papa_market_variant_info', { p_variant_id: missingId }),
+    ])
+    expect(cart.error).toBeNull()
+    expect(variant.error).toBeNull()
+    expect(cart.data).toEqual([])
+    expect(variant.data).toEqual([])
+  })
+
+  it('exposes market catalog and order lifecycle RPCs with safe missing-ID probes', async () => {
+    const [products, categories, cancelled, refunded, checkout] = await Promise.all([
+      client.rpc('papa_market_list_products', {
+        p_query: 'no-such-market-integration-item', p_category: null, p_min_pesewas: null, p_max_pesewas: null,
+        p_condition: null, p_in_stock: false, p_deals: false, p_delivery: false, p_district_id: null,
+        p_rating_min: null, p_shop_id: missingId, p_sort: 'best', p_page: 1, p_limit: 5,
+        p_exclude_id: null, p_ids: null, p_since: null,
+      }),
+      client.rpc('papa_market_category_counts'),
+      client.rpc('papa_market_cancel_order', { p_order_id: missingId, p_by: 'system', p_actor_id: null, p_reason: 'integration probe' }),
+      client.rpc('papa_market_record_refund', { p_order_id: missingId, p_amount: 1 }),
+      client.rpc('papa_market_set_checkout_paid', { p_checkout_id: missingId, p_ok: false }),
+    ])
+    for (const result of [products, categories, cancelled, refunded, checkout]) expect(result.error).toBeNull()
+    expect(products.data).toEqual([])
+    expect(Array.isArray(categories.data)).toBe(true)
+    expect(cancelled.data).toEqual([])
+    expect(refunded.data).toEqual([])
+    expect(checkout.data).toEqual([])
+  })
+
   it('exposes Market admin read RPCs without mutating Market data', async () => {
     const [stats, orders, requests, products, shops, data] = await Promise.all([
       client.rpc('papa_market_admin_stats'),
@@ -180,6 +212,37 @@ integration('Supabase migration RPC integration (read-only/safe probes)', () => 
     expect(products.data).toHaveProperty('rows')
     expect(shops.data).toHaveProperty('rows')
     expect(data.data).toHaveProperty('marketOrders')
+  })
+
+  it('does not allow product save through a shop the actor does not own', async () => {
+    const result = await client.rpc('papa_market_save_product', {
+      p_user_id: missingId,
+      p_shop_id: missingId,
+      p_product_id: null,
+      p_values: { title: 'Test', category: 'test', condition: 'new', images: [], option_names: [], price_pesewas: 100, status: 'draft' },
+      p_variants: [],
+    })
+    expect(result.error?.message).toContain('shop_not_found')
+  })
+
+  it('exposes product and order detail RPCs and review helpers for nonexistent IDs', async () => {
+    const [product, questions, reviews, order, rating, reply, hidden] = await Promise.all([
+      client.rpc('papa_market_product_detail', { p_product_id: missingId, p_viewer_id: missingId }),
+      client.rpc('papa_market_product_questions', { p_product_id: missingId, p_viewer_id: missingId, p_limit: 10 }),
+      client.rpc('papa_market_product_reviews', { p_product_id: missingId, p_viewer_id: missingId, p_limit: 10 }),
+      client.rpc('papa_market_order_detail', { p_order_id: missingId, p_viewer_id: missingId, p_viewer_role: 'member' }),
+      client.rpc('papa_market_adjust_product_rating', { p_product_id: missingId, p_rating_delta: 0, p_count_delta: 0 }),
+      client.rpc('papa_market_reply_review', { p_review_id: missingId, p_user_id: missingId, p_reply: 'probe' }),
+      client.rpc('papa_market_hide_review', { p_review_id: missingId }),
+    ])
+    for (const result of [product, questions, reviews, order, rating, reply, hidden]) expect(result.error).toBeNull()
+    expect(product.data).toBeNull()
+    expect(Array.isArray(questions.data)).toBe(true)
+    expect(Array.isArray(reviews.data)).toBe(true)
+    expect(order.data).toBeNull()
+    expect(rating.data).toBe(false)
+    expect(reply.data).toBe(false)
+    expect(hidden.data).toBe(false)
   })
 
 })

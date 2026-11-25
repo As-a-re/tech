@@ -2,9 +2,10 @@
 
 ## Completed in this revision
 
-- Added SQL/RPC migrations `0035`–`0047` for full-text post search, cursor-paged discovery and post feeds, trending/popular/suggested content, atomic external church-directory sync, scoped notifications and push subscription lookup, announcement CRUD/listing/view counts, prayer interactions, testimony mutations, event lifecycle/listing/reminder claims, CLI Tech Admin grants, and atomic resource-order stock/payment settlement.
+- Added SQL/RPC migrations `0035`–`0047` for full-text post search, cursor-paged discovery and post feeds, trending/popular/suggested content, atomic external church-directory sync, scoped notifications and push subscription lookup, announcement CRUD/listing/view counts, prayer interactions, testimony mutations, event lifecycle/listing/reminder claims, CLI Tech Admin grants, and atomic resource-order stock/payment settlement. Added `0053_market_checkout_state_rpc.sql` for atomic checkout payment transitions and `0054_market_cart_read_rpc.sql` for cart snapshot and variant reads; both have been applied to the connected Supabase project.
 - Converted `server/discovery/search.ts`, `explore.ts`, `lists.ts`, `saved.ts`, `server/posts/feeds.ts`, and `server/posts/visibility.ts` to Supabase JS/RPC-based access.
 - Converted `server/community/levels.ts`, `announcements.ts`, and `events.ts` to Supabase JS/RPC-based access.
+- Began the broader Market migration: cart snapshots and variant validation now use new service-role RPCs; cart add/update/save, checkout creation, and payment-success/failure transitions use Supabase RPCs. The deployed checkout transition performs status, event, stock/coupon, sold-count, and cart updates atomically. Remaining cart reads and catalog/order Drizzle paths are still outstanding.
 - Converted `server/devotion/birthdays.ts`, `prayer.ts`, and `testimonies.ts` to Supabase JS/RPC-based access.
 - Converted `server/messages/access.ts`, `server/admin/content.ts`, `server/market/shared.ts` order-event writing, the church-directory integration adapters, and `server/live/live.ts` and `server/resources/resources.ts` to Supabase JS/RPC. Live streaming no longer imports Drizzle or the legacy database module. `server/market/shared.ts` still exposes a SQL visibility fragment consumed by the legacy catalog query path; the catalog query path remains to be converted.
 - Converted CLI database setup and register scripts (`scripts/lib/db.ts`, `first-member.ts`, `grant-admin.ts`, `church-import.ts`) to use the Supabase service-role client. `db/register-ops.ts` now uses Supabase JS while retaining the CSV parser used by tests.
@@ -23,11 +24,10 @@ The remaining 38 files are mainly Drizzle schema definitions, database initializ
 
 ## Validation status
 
-- `node scripts/verify-supabase-migrations.mjs`: passed; 30 individual migrations (`0018`–`0047`) match the consolidated SQL bundle.
-- TypeScript syntax transpilation: passed for `server/live/live.ts` and `server/resources/resources.ts` (syntax only; not a typecheck).
-- Full TypeScript typecheck and production build: **not verified**. Dependencies are not installed in this environment; the global `tsc` run reports missing framework modules and cannot establish a valid project typecheck.
-- Unit and Supabase integration tests: **not run**. Integration probes have been added but require `SUPABASE_INTEGRATION_TESTS=1`, a disposable/test Supabase project, and `SUPABASE_SERVICE_ROLE_KEY`.
-- SQL execution against PostgreSQL/Supabase: **not run** for migrations `0035`–`0047`. They must be applied and validated against a disposable Supabase project before production.
+- `pnpm run supabase:verify`: passed; all 37 bundled individual RPC migrations match their migration files, including `0053` and `0054`.
+- `pnpm run typecheck`: passed after the cart/checkout changes.
+- Focused Market/Seller/Rider Vitest suites: **blocked before tests ran** because their shared Drizzle cleanup connection failed with `SELF_SIGNED_CERT_IN_CHAIN`; all 42 tests were skipped.
+- Supabase RPC integration probes and SQL execution on a disposable database remain unverified. Migration `0053` applied successfully to the connected Supabase project; broader integration checks are still required.
 
 ## Safe rollout
 

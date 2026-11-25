@@ -12,6 +12,7 @@ export function VerifyForm() {
   return (
     <form action={action} className="mt-6 space-y-4">
       <FormAlert message={s.error && t(`auth.err.${s.error}` as MessageKey)} />
+      <Field label={t('auth.password')} name="password" type="password" required autoComplete="current-password" />
       <Field label={t('auth.twoFaCode')} name="code" required autoComplete="one-time-code" autoCapitalize="none" maxLength={11} autoFocus
         className="[&_input]:text-center [&_input]:font-mono [&_input]:text-xl [&_input]:tracking-[0.3em]" />
       <SubmitButton>{t('auth.verify')}</SubmitButton>

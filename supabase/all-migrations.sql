@@ -2748,7 +2748,7 @@ begin
  where (nullif(p_action,'') is null or a.action ilike replace(replace(replace(p_action,'\','\\'),'%','\%'),'_','\_')||'%' escape '\')
  and (nullif(p_actor,'') is null or lower(coalesce(u.username,''))=lower(ltrim(p_actor,'@')))
  and (p_from is null or a.created_at>=p_from) and (p_to is null or a.created_at<=p_to);
- select coalesce(jsonb_agg(to_jsonb(x) order by x.created_at desc),'[]'::jsonb) into v_rows from (
+ select coalesce(jsonb_agg(to_jsonb(x) order by x."createdAt" desc),'[]'::jsonb) into v_rows from (
  select a.id,a.action,a.target,a.meta,a.ip,a.created_at as "createdAt",u.username,u.full_name as "fullName" from audit_log a left join users u on u.id=a.actor_id
  where (nullif(p_action,'') is null or a.action ilike replace(replace(replace(p_action,'\','\\'),'%','\%'),'_','\_')||'%' escape '\')
  and (nullif(p_actor,'') is null or lower(coalesce(u.username,''))=lower(ltrim(p_actor,'@')))
@@ -3548,3 +3548,665 @@ revoke all on function public.papa_manage_resource_order(uuid,text,uuid,text) fr
 grant execute on function public.papa_place_resource_order(uuid,uuid,text,integer) to service_role;
 grant execute on function public.papa_set_resource_order_payment(uuid,boolean,text) to service_role;
 grant execute on function public.papa_manage_resource_order(uuid,text,uuid,text) to service_role;
+
+-- ===== 0048_audit_log_created_at_order.sql =====
+-- Correct the audit JSON aggregation order to reference its quoted camelCase alias.
+create or replace function public.papa_list_audit_log(p_action text default null,p_actor text default null,p_from timestamptz default null,p_to timestamptz default null,p_page integer default 1,p_page_size integer default 50)
+returns jsonb language plpgsql stable security definer set search_path=public as $$
+declare v_page integer:=greatest(1,coalesce(p_page,1)); v_size integer:=least(100,greatest(1,coalesce(p_page_size,50))); v_total bigint; v_rows jsonb;
+begin
+ select count(*) into v_total from audit_log a left join users u on u.id=a.actor_id
+ where (nullif(p_action,'') is null or a.action ilike replace(replace(replace(p_action,'\','\\'),'%','\%'),'_','\_')||'%' escape '\')
+ and (nullif(p_actor,'') is null or lower(coalesce(u.username,''))=lower(ltrim(p_actor,'@')))
+ and (p_from is null or a.created_at>=p_from) and (p_to is null or a.created_at<=p_to);
+ select coalesce(jsonb_agg(to_jsonb(x) order by x."createdAt" desc),'[]'::jsonb) into v_rows from (
+ select a.id,a.action,a.target,a.meta,a.ip,a.created_at as "createdAt",u.username,u.full_name as "fullName" from audit_log a left join users u on u.id=a.actor_id
+ where (nullif(p_action,'') is null or a.action ilike replace(replace(replace(p_action,'\','\\'),'%','\%'),'_','\_')||'%' escape '\')
+ and (nullif(p_actor,'') is null or lower(coalesce(u.username,''))=lower(ltrim(p_actor,'@')))
+ and (p_from is null or a.created_at>=p_from) and (p_to is null or a.created_at<=p_to)
+ order by a.created_at desc limit v_size offset (v_page-1)*v_size) x;
+ return jsonb_build_object('rows',v_rows,'total',v_total,'page',v_page,'pages',greatest(1,ceil(v_total::numeric/v_size)::integer));
+end $$;
+-- ===== 0049_market_product_save_rpc.sql =====
+create or replace function public.papa_market_save_product(
+  p_user_id uuid,
+  p_shop_id uuid,
+  p_product_id uuid,
+  p_values jsonb,
+  p_variants jsonb
+) returns uuid
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_product_id uuid := p_product_id;
+  v_variant jsonb;
+  v_options jsonb;
+  v_variant_id uuid;
+  v_kept_ids uuid[] := array[]::uuid[];
+begin
+  if not exists (
+    select 1 from public.shops s
+    where s.id = p_shop_id and s.owner_id = p_user_id and s.deleted_at is null
+  ) then
+    raise exception 'shop_not_found';
+  end if;
+
+  if v_product_id is null then
+    insert into public.products (
+      shop_id, title, description, category, condition, images, option_names, price_pesewas,
+      compare_at_pesewas, deal_ends_at, status, updated_at, published_at
+    ) values (
+      p_shop_id, p_values->>'title', coalesce(p_values->>'description', ''), p_values->>'category',
+      (p_values->>'condition')::public.product_condition, coalesce(p_values->'images', '[]'::jsonb),
+      coalesce(p_values->'option_names', '[]'::jsonb), (p_values->>'price_pesewas')::integer,
+      nullif(p_values->>'compare_at_pesewas', '')::integer, nullif(p_values->>'deal_ends_at', '')::timestamptz,
+      (p_values->>'status')::public.product_status, now(), nullif(p_values->>'published_at', '')::timestamptz
+    ) returning id into v_product_id;
+  else
+    update public.products p set
+      title = p_values->>'title', description = coalesce(p_values->>'description', ''), category = p_values->>'category',
+      condition = (p_values->>'condition')::public.product_condition, images = coalesce(p_values->'images', '[]'::jsonb),
+      option_names = coalesce(p_values->'option_names', '[]'::jsonb), price_pesewas = (p_values->>'price_pesewas')::integer,
+      compare_at_pesewas = nullif(p_values->>'compare_at_pesewas', '')::integer,
+      deal_ends_at = nullif(p_values->>'deal_ends_at', '')::timestamptz,
+      status = (p_values->>'status')::public.product_status, updated_at = now(),
+      published_at = case when p_values ? 'published_at' then nullif(p_values->>'published_at', '')::timestamptz else p.published_at end
+    where p.id = v_product_id and p.shop_id = p_shop_id and p.deleted_at is null;
+    if not found then raise exception 'product_not_found'; end if;
+  end if;
+
+  for v_variant in select value from jsonb_array_elements(coalesce(p_variants, '[]'::jsonb)) loop
+    v_options := coalesce(v_variant->'options', '{}'::jsonb);
+    v_variant_id := null;
+    if nullif(v_variant->>'id', '') is not null then
+      select pv.id into v_variant_id from public.product_variants pv
+      where pv.id = (v_variant->>'id')::uuid and pv.product_id = v_product_id;
+    end if;
+    if v_variant_id is null then
+      select pv.id into v_variant_id from public.product_variants pv
+      where pv.product_id = v_product_id and pv.options = v_options and not (pv.id = any(v_kept_ids))
+      order by pv.position limit 1;
+    end if;
+
+    if v_variant_id is not null then
+      update public.product_variants set
+        name = coalesce(v_variant->>'name', ''), options = v_options,
+        price_pesewas = (v_variant->>'price_pesewas')::integer, stock = (v_variant->>'stock')::integer,
+        sku = nullif(v_variant->>'sku', ''), position = (v_variant->>'position')::integer, active = true
+      where id = v_variant_id;
+    else
+      insert into public.product_variants (product_id, name, options, price_pesewas, stock, sku, position, active)
+      values (
+        v_product_id, coalesce(v_variant->>'name', ''), v_options,
+        (v_variant->>'price_pesewas')::integer, (v_variant->>'stock')::integer,
+        nullif(v_variant->>'sku', ''), (v_variant->>'position')::integer, true
+      ) returning id into v_variant_id;
+    end if;
+    v_kept_ids := array_append(v_kept_ids, v_variant_id);
+  end loop;
+
+  update public.product_variants pv set active = false
+  where pv.product_id = v_product_id and not (pv.id = any(v_kept_ids));
+
+  return v_product_id;
+end;
+$$;
+
+revoke all on function public.papa_market_save_product(uuid, uuid, uuid, jsonb, jsonb) from public, anon, authenticated;
+grant execute on function public.papa_market_save_product(uuid, uuid, uuid, jsonb, jsonb) to service_role;
+
+-- ===== 0050_market_catalog_read_rpc.sql =====
+create or replace function public.papa_market_list_products(
+  p_query text default null,
+  p_category text default null,
+  p_min_pesewas integer default null,
+  p_max_pesewas integer default null,
+  p_condition text default null,
+  p_in_stock boolean default false,
+  p_deals boolean default false,
+  p_delivery boolean default false,
+  p_district_id uuid default null,
+  p_rating_min numeric default null,
+  p_shop_id uuid default null,
+  p_sort text default 'best',
+  p_page integer default 1,
+  p_limit integer default 24,
+  p_exclude_id uuid default null,
+  p_ids uuid[] default null,
+  p_since timestamptz default null
+) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  with words as (
+    select word from unnest(regexp_split_to_array(lower(coalesce(p_query, '')), '\s+')) as word
+    where length(word) > 0
+    limit 6
+  ), filtered as (
+    select p.id, p.title, p.images ->> 0 as image, p.price_pesewas as price,
+      case when p.compare_at_pesewas > p.price_pesewas and (p.deal_ends_at is null or p.deal_ends_at > now()) then p.compare_at_pesewas end as was,
+      p.rating_sum, p.rating_count, p.sold_count as sold, p.condition::text as condition, p.category,
+      s.name as shop_name, s.slug as shop_slug, s.town,
+      exists(select 1 from public.product_variants v where v.product_id = p.id and v.active and v.stock > 0) as in_stock,
+      (p.sold_count * 3 + p.rating_count * 2 + p.view_count / 20.0) as popularity,
+      case when p.title ilike '%' || coalesce(p_query, '') || '%' then 0 else 1 end as match_rank,
+      p.created_at
+    from public.products p
+    join public.shops s on s.id = p.shop_id
+    join public.users u on u.id = s.owner_id
+    where p.status = 'active' and p.deleted_at is null and s.status = 'active' and s.deleted_at is null and u.status = 'active'
+      and (p_category is null or p.category = p_category)
+      and (p_min_pesewas is null or p.price_pesewas >= p_min_pesewas)
+      and (p_max_pesewas is null or p.price_pesewas <= p_max_pesewas)
+      and (p_condition is null or p.condition::text = p_condition)
+      and (not coalesce(p_in_stock, false) or exists(select 1 from public.product_variants v where v.product_id = p.id and v.active and v.stock > 0))
+      and (not coalesce(p_deals, false) or (p.compare_at_pesewas > p.price_pesewas and (p.deal_ends_at is null or p.deal_ends_at > now())))
+      and (not coalesce(p_delivery, false) or s.offers_delivery)
+      and (p_district_id is null or s.assembly_id in (select a.id from public.assemblies a where a.district_id = p_district_id))
+      and (p_rating_min is null or (p.rating_count > 0 and p.rating_sum::numeric / p.rating_count >= p_rating_min))
+      and (p_shop_id is null or p.shop_id = p_shop_id)
+      and (p_exclude_id is null or p.id <> p_exclude_id)
+      and (p_ids is null or p.id = any(p_ids))
+      and (p_since is null or p.created_at > p_since)
+      and not exists(select 1 from words w where not (p.title ilike '%' || w.word || '%' or p.description ilike '%' || w.word || '%' or s.name ilike '%' || w.word || '%' or p.category = w.word))
+  ), paged as (
+    select * from filtered
+    order by
+      case when p_sort = 'price_asc' then price end asc,
+      case when p_sort = 'price_desc' then price end desc,
+      case when p_sort = 'rating' then case when rating_count > 0 then rating_sum::numeric / rating_count else 0 end end desc,
+      case when p_sort = 'popular' then popularity end desc,
+      case when p_sort not in ('newest','price_asc','price_desc','rating','popular') then match_rank end asc,
+      case when p_sort in ('best','popular') then popularity end desc,
+      case when p_sort = 'newest' then created_at end desc,
+      created_at desc, id
+    offset (greatest(1, least(200, coalesce(p_page, 1))) - 1) * least(60, greatest(1, coalesce(p_limit, 24)))
+    limit least(61, greatest(2, coalesce(p_limit, 24) + 1))
+  )
+  select coalesce(jsonb_agg(to_jsonb(paged)), '[]'::jsonb) from paged;
+$$;
+
+create or replace function public.papa_market_category_counts()
+returns table(category text, n bigint)
+language sql stable security definer set search_path = '' as $$
+  select p.category::text, count(*) from public.products p
+  join public.shops s on s.id = p.shop_id join public.users u on u.id = s.owner_id
+  where p.status = 'active' and p.deleted_at is null and s.status = 'active' and s.deleted_at is null and u.status = 'active'
+  group by p.category;
+$$;
+
+revoke all on function public.papa_market_list_products(text,text,integer,integer,text,boolean,boolean,boolean,uuid,numeric,uuid,text,integer,integer,uuid,uuid[],timestamptz) from public, anon, authenticated;
+revoke all on function public.papa_market_category_counts() from public, anon, authenticated;
+grant execute on function public.papa_market_list_products(text,text,integer,integer,text,boolean,boolean,boolean,uuid,numeric,uuid,text,integer,integer,uuid,uuid[],timestamptz) to service_role;
+grant execute on function public.papa_market_category_counts() to service_role;
+
+-- ===== 0051_market_order_lifecycle_rpc.sql =====
+create or replace function public.papa_market_cancel_order(p_order_id uuid, p_by text, p_actor_id uuid, p_reason text)
+returns table (id uuid, buyer_id uuid, seller_id uuid, coupon_id uuid, total_pesewas integer, refunded_pesewas integer, checkout_id uuid)
+language plpgsql security definer set search_path = '' as $$
+declare
+  v_cancelled_deliveries integer;
+begin
+  if p_by not in ('buyer', 'seller', 'admin', 'system') then return; end if;
+  update public.market_orders
+  set status = 'cancelled', cancelled_at = now(), cancel_reason = left(coalesce(p_reason, ''), 300)
+  where market_orders.id = p_order_id and market_orders.status in ('paid', 'accepted', 'packed', 'shipped');
+  if not found then return; end if;
+
+  insert into public.market_order_events (order_id, kind, actor_id, note)
+  values (p_order_id, 'cancelled_by_' || p_by, p_actor_id, left(coalesce(p_reason, ''), 300));
+
+  update public.deliveries set status = 'cancelled', cancelled_at = now()
+  where order_id = p_order_id and status in ('open', 'accepted', 'picked_up');
+  get diagnostics v_cancelled_deliveries = row_count;
+  if v_cancelled_deliveries > 0 then
+    update public.market_orders set rider_fee_pesewas = 0 where market_orders.id = p_order_id;
+  end if;
+
+  update public.product_variants v set stock = v.stock + i.qty
+  from public.market_order_items i where i.order_id = p_order_id and i.variant_id = v.id;
+  update public.coupons c set used_count = greatest(c.used_count - 1, 0)
+  from public.market_orders o where o.id = p_order_id and o.coupon_id = c.id;
+  update public.products p set sold_count = greatest(p.sold_count - i.qty, 0)
+  from (select product_id, sum(qty)::integer as qty from public.market_order_items where order_id = p_order_id group by product_id) i
+  where p.id = i.product_id;
+
+  return query select o.id, o.buyer_id, o.seller_id, o.coupon_id, o.total_pesewas, o.refunded_pesewas, o.checkout_id
+  from public.market_orders o where o.id = p_order_id;
+end;
+$$;
+
+create or replace function public.papa_market_record_refund(p_order_id uuid, p_amount integer)
+returns table (id uuid, buyer_id uuid, checkout_id uuid, refunded_pesewas integer, total_pesewas integer)
+language plpgsql security definer set search_path = '' as $$
+declare
+  v_order public.market_orders%rowtype;
+  v_refunded integer;
+  v_remaining integer;
+  v_fee integer;
+begin
+  select * into v_order from public.market_orders where id = p_order_id for update;
+  if not found or v_order.paid_at is null or v_order.escrow = 'released'
+    or p_amount is null or p_amount < 1 or p_amount > v_order.total_pesewas - v_order.refunded_pesewas then
+    return;
+  end if;
+  v_refunded := v_order.refunded_pesewas + p_amount;
+  v_remaining := v_order.total_pesewas - v_refunded;
+  v_fee := round((least(v_order.subtotal_pesewas - v_order.discount_pesewas, v_remaining)::numeric * v_order.fee_bps) / 10000)::integer;
+  update public.market_orders set refunded_pesewas = v_refunded, fee_pesewas = v_fee,
+    seller_net_pesewas = greatest(0, v_remaining - v_fee - v_order.rider_fee_pesewas),
+    escrow = case when v_remaining = 0 then 'refunded' else escrow end
+  where market_orders.id = p_order_id;
+  return query select o.id, o.buyer_id, o.checkout_id, o.refunded_pesewas, o.total_pesewas
+  from public.market_orders o where o.id = p_order_id;
+end;
+$$;
+
+revoke all on function public.papa_market_cancel_order(uuid,text,uuid,text) from public, anon, authenticated;
+revoke all on function public.papa_market_record_refund(uuid,integer) from public, anon, authenticated;
+grant execute on function public.papa_market_cancel_order(uuid,text,uuid,text) to service_role;
+grant execute on function public.papa_market_record_refund(uuid,integer) to service_role;
+
+-- ===== 0052_market_refund_rpc_ambiguity.sql =====
+create or replace function public.papa_market_record_refund(p_order_id uuid, p_amount integer)
+returns table (id uuid, buyer_id uuid, checkout_id uuid, refunded_pesewas integer, total_pesewas integer)
+language plpgsql security definer set search_path = '' as $$
+declare
+  v_order public.market_orders%rowtype;
+  v_refunded integer;
+  v_remaining integer;
+  v_fee integer;
+begin
+  select mo.* into v_order from public.market_orders as mo where mo.id = p_order_id for update;
+  if not found or v_order.paid_at is null or v_order.escrow = 'released'
+    or p_amount is null or p_amount < 1 or p_amount > v_order.total_pesewas - v_order.refunded_pesewas then
+    return;
+  end if;
+  v_refunded := v_order.refunded_pesewas + p_amount;
+  v_remaining := v_order.total_pesewas - v_refunded;
+  v_fee := round((least(v_order.subtotal_pesewas - v_order.discount_pesewas, v_remaining)::numeric * v_order.fee_bps) / 10000)::integer;
+  update public.market_orders set refunded_pesewas = v_refunded, fee_pesewas = v_fee,
+    seller_net_pesewas = greatest(0, v_remaining - v_fee - v_order.rider_fee_pesewas),
+    escrow = case when v_remaining = 0 then 'refunded' else escrow end
+  where public.market_orders.id = p_order_id;
+  return query select o.id, o.buyer_id, o.checkout_id, o.refunded_pesewas, o.total_pesewas
+  from public.market_orders o where o.id = p_order_id;
+end;
+$$;
+revoke all on function public.papa_market_record_refund(uuid,integer) from public, anon, authenticated;
+grant execute on function public.papa_market_record_refund(uuid,integer) to service_role;
+
+-- ===== 0053_market_checkout_state_rpc.sql =====
+create or replace function public.papa_market_set_checkout_paid(p_checkout_id uuid, p_ok boolean)
+returns table (id uuid, buyer_id uuid, seller_id uuid, number text, subtotal_pesewas integer, total_pesewas integer)
+language plpgsql security definer set search_path = '' as $$
+declare
+  v_order_ids uuid[];
+begin
+  select array_agg(mo.id) into v_order_ids
+  from public.market_orders as mo
+  where mo.checkout_id = p_checkout_id and mo.status = 'pending_payment';
+
+  if coalesce(cardinality(v_order_ids), 0) = 0 then
+    return;
+  end if;
+
+  if p_ok then
+    return query
+      update public.market_orders as mo
+      set status = 'paid', paid_at = now(), escrow = 'held',
+          handover_code = lpad((floor(random() * 900000) + 100000)::text, 6, '0')
+      where mo.id = any(v_order_ids)
+      returning mo.id, mo.buyer_id, mo.seller_id, mo.number, mo.subtotal_pesewas, mo.total_pesewas;
+
+    insert into public.market_order_events (order_id, kind)
+    select unnest(v_order_ids), 'paid';
+
+    update public.products as p
+    set sold_count = p.sold_count + item_totals.qty
+    from (
+      select i.product_id, sum(i.qty)::integer as qty
+      from public.market_order_items as i
+      where i.order_id = any(v_order_ids) and i.product_id is not null
+      group by i.product_id
+    ) as item_totals
+    where p.id = item_totals.product_id;
+
+    delete from public.cart_items as ci
+    where ci.user_id = (select mo.buyer_id from public.market_orders as mo where mo.id = v_order_ids[1])
+      and not ci.saved_for_later
+      and ci.variant_id in (
+        select i.variant_id from public.market_order_items as i
+        where i.order_id = any(v_order_ids) and i.variant_id is not null
+      );
+  else
+    return query
+      update public.market_orders as mo
+      set status = 'cancelled', cancelled_at = now(), cancel_reason = 'payment_failed'
+      where mo.id = any(v_order_ids)
+      returning mo.id, mo.buyer_id, mo.seller_id, mo.number, mo.subtotal_pesewas, mo.total_pesewas;
+
+    update public.product_variants as v
+    set stock = v.stock + item_totals.qty
+    from (
+      select i.variant_id, sum(i.qty)::integer as qty
+      from public.market_order_items as i
+      where i.order_id = any(v_order_ids) and i.variant_id is not null
+      group by i.variant_id
+    ) as item_totals
+    where v.id = item_totals.variant_id;
+
+    update public.coupons as c
+    set used_count = greatest(c.used_count - used.coupon_count, 0)
+    from (
+      select mo.coupon_id, count(*)::integer as coupon_count
+      from public.market_orders as mo
+      where mo.id = any(v_order_ids) and mo.coupon_id is not null
+      group by mo.coupon_id
+    ) as used
+    where c.id = used.coupon_id;
+
+    insert into public.market_order_events (order_id, kind)
+    select unnest(v_order_ids), 'payment_failed';
+  end if;
+end;
+$$;
+revoke all on function public.papa_market_set_checkout_paid(uuid,boolean) from public, anon, authenticated;
+grant execute on function public.papa_market_set_checkout_paid(uuid,boolean) to service_role;
+
+-- ===== 0054_market_cart_read_rpc.sql =====
+create or replace function public.papa_market_cart_snapshot(p_user_id uuid)
+returns table (
+  id uuid, variant_id uuid, product_id uuid, title text, variant_name text, image text,
+  unit integer, qty integer, stock integer, available boolean, saved boolean,
+  shop_id uuid, shop_name text, shop_slug text, offers_pickup boolean, offers_delivery boolean,
+  delivery_fee integer, free_over integer, pickup_address text, delivery_note text
+)
+language sql stable security definer set search_path = '' as $$
+  select c.id, c.variant_id, p.id, p.title, v.name, p.images ->> 0, v.price_pesewas,
+    c.qty, v.stock,
+    (p.status = 'active' and p.deleted_at is null and s.status = 'active' and s.deleted_at is null and u.status = 'active' and v.active and v.stock > 0),
+    c.saved_for_later, s.id, s.name, s.slug, s.offers_pickup, s.offers_delivery,
+    s.delivery_fee_pesewas, s.free_delivery_over_pesewas, s.pickup_address, s.delivery_note
+  from public.cart_items as c
+  join public.product_variants as v on v.id = c.variant_id
+  join public.products as p on p.id = v.product_id
+  join public.shops as s on s.id = p.shop_id
+  join public.users as u on u.id = s.owner_id
+  where c.user_id = p_user_id
+  order by c.created_at desc;
+$$;
+
+create or replace function public.papa_market_variant_info(p_variant_id uuid)
+returns table (stock integer, owner_id uuid, product_id uuid)
+language sql stable security definer set search_path = '' as $$
+  select v.stock, s.owner_id, p.id
+  from public.product_variants as v
+  join public.products as p on p.id = v.product_id
+  join public.shops as s on s.id = p.shop_id
+  join public.users as u on u.id = s.owner_id
+  where v.id = p_variant_id and v.active and p.status = 'active' and p.deleted_at is null
+    and s.status = 'active' and s.deleted_at is null and u.status = 'active';
+$$;
+
+revoke all on function public.papa_market_cart_snapshot(uuid) from public, anon, authenticated;
+revoke all on function public.papa_market_variant_info(uuid) from public, anon, authenticated;
+grant execute on function public.papa_market_cart_snapshot(uuid) to service_role;
+grant execute on function public.papa_market_variant_info(uuid) to service_role;
+
+-- ===== 0055_market_order_list_rpc.sql =====
+create or replace function public.papa_market_order_list(p_user_id uuid, p_seller boolean default false, p_filter text default null)
+returns table (
+  id uuid, number text, shop_name text, shop_slug text, status text, fulfilment text, total_pesewas integer,
+  created_at timestamptz, item_count integer, first_title text, images text[], buyer_name text, open_request text
+)
+language sql stable security definer set search_path = '' as $$
+  select o.id, o.number, o.shop_name, s.slug, o.status::text, o.fulfilment::text, o.total_pesewas, o.created_at,
+    coalesce((select sum(i.qty)::integer from public.market_order_items i where i.order_id = o.id), 0),
+    (select i.title from public.market_order_items i where i.order_id = o.id order by i.total_pesewas desc limit 1),
+    coalesce((select array_agg(x.image) from (select i.image from public.market_order_items i where i.order_id = o.id and i.image is not null limit 3) x), array[]::text[]),
+    (select u.full_name from public.users u where u.id = o.buyer_id),
+    (select r.kind::text from public.market_requests r where r.order_id = o.id and r.status = 'open' limit 1)
+  from public.market_orders o
+  left join public.shops s on s.id = o.shop_id
+  where (case when coalesce(p_seller, false) then o.seller_id else o.buyer_id end) = p_user_id
+    and (
+      (coalesce(p_seller, false) and o.paid_at is not null)
+      or (not coalesce(p_seller, false) and (o.paid_at is not null or o.created_at > now() - interval '2 hours'))
+    )
+    and (
+      p_filter is null or p_filter = 'all'
+      or (not coalesce(p_seller, false) and p_filter = 'active' and o.status in ('paid', 'accepted', 'packed', 'shipped'))
+      or (not coalesce(p_seller, false) and p_filter = 'delivered' and o.status in ('delivered', 'completed'))
+      or (not coalesce(p_seller, false) and p_filter = 'cancelled' and o.status = 'cancelled')
+      or (coalesce(p_seller, false) and o.status::text = p_filter)
+    )
+  order by o.created_at desc, o.id desc
+  limit 200;
+$$;
+revoke all on function public.papa_market_order_list(uuid, boolean, text) from public, anon, authenticated;
+grant execute on function public.papa_market_order_list(uuid, boolean, text) to service_role;
+
+-- ===== 0056_market_catalog_member_cards_rpc.sql =====
+create or replace function public.papa_market_catalog_member_cards(
+  p_user_id uuid,
+  p_kind text,
+  p_shop_id uuid default null,
+  p_limit integer default 24
+)
+returns table (
+  id uuid, title text, image text, price integer, was integer, rating_sum integer, rating_count integer, sold integer,
+  in_stock boolean, condition text, category text, shop_name text, shop_slug text, town text
+)
+language sql stable security definer set search_path = '' as $$
+  select p.id, p.title, p.images ->> 0, p.price_pesewas,
+    case when p.compare_at_pesewas > p.price_pesewas and (p.deal_ends_at is null or p.deal_ends_at > now()) then p.compare_at_pesewas end,
+    p.rating_sum, p.rating_count, p.sold_count,
+    exists (select 1 from public.product_variants v where v.product_id = p.id and v.active and v.stock > 0),
+    p.condition::text, p.category::text, s.name, s.slug, s.town
+  from public.products p
+  join public.shops s on s.id = p.shop_id
+  join public.users u on u.id = s.owner_id
+  left join public.recently_viewed rv on p_kind = 'recent' and rv.product_id = p.id and rv.user_id = p_user_id
+  left join public.wishlist_items w on p_kind = 'wishlist' and w.product_id = p.id and w.user_id = p_user_id
+  left join public.shop_follows f on p_kind = 'followed' and f.shop_id = p.shop_id and f.user_id = p_user_id
+  where p.status = 'active' and p.deleted_at is null and s.status = 'active' and s.deleted_at is null and u.status = 'active'
+    and (
+      (p_kind = 'recent' and rv.product_id is not null)
+      or (p_kind = 'wishlist' and w.product_id is not null)
+      or (p_kind = 'followed' and f.shop_id is not null and p.created_at > now() - interval '60 days')
+      or (p_kind = 'shop' and p.shop_id = p_shop_id)
+    )
+  order by
+    case when p_kind = 'recent' then rv.viewed_at end desc,
+    case when p_kind = 'wishlist' then w.created_at end desc,
+    case when p_kind = 'followed' then p.created_at end desc,
+    case when p_kind = 'shop' then p.created_at end desc,
+    p.id
+  limit least(500, greatest(1, coalesce(p_limit, 24)));
+$$;
+revoke all on function public.papa_market_catalog_member_cards(uuid, text, uuid, integer) from public, anon, authenticated;
+grant execute on function public.papa_market_catalog_member_cards(uuid, text, uuid, integer) to service_role;
+
+-- ===== 0057_market_detail_read_rpc.sql =====
+create or replace function public.papa_market_product_detail(p_product_id uuid, p_viewer_id uuid default null)
+returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select jsonb_build_object(
+    'product', jsonb_build_object(
+      'id', p.id, 'title', p.title, 'description', p.description, 'category', p.category::text,
+      'condition', p.condition::text, 'images', p.images, 'option_names', p.option_names,
+      'price', p.price_pesewas, 'compare_at', p.compare_at_pesewas, 'deal_ends_at', p.deal_ends_at,
+      'rating_sum', p.rating_sum, 'rating_count', p.rating_count, 'sold', p.sold_count,
+      'status', p.status::text, 'created_at', p.created_at, 'deleted', p.deleted_at is not null,
+      'shop_id', s.id, 'shop_name', s.name, 'shop_slug', s.slug, 'shop_logo', s.logo_url,
+      'shop_town', s.town, 'shop_status', s.status::text, 'owner_id', s.owner_id,
+      'owner_status', u.status::text, 'owner_username', u.username, 'owner_name', u.full_name,
+      'offers_pickup', s.offers_pickup, 'offers_delivery', s.offers_delivery,
+      'delivery_fee', s.delivery_fee_pesewas, 'free_over', s.free_delivery_over_pesewas,
+      'delivery_note', s.delivery_note, 'pickup_address', s.pickup_address, 'return_days', s.return_days,
+      'shop_verified', s.verified_at is not null,
+      'assembly_name', (select a.name from public.assemblies a where a.id = s.assembly_id)
+    ),
+    'variants', coalesce((select jsonb_agg(jsonb_build_object(
+      'id', v.id, 'name', v.name, 'options', v.options, 'pricePesewas', v.price_pesewas, 'stock', v.stock
+    ) order by v.position, v.price_pesewas) from public.product_variants v where v.product_id = p.id and v.active), '[]'::jsonb),
+    'stars', coalesce((select jsonb_agg(jsonb_build_object('rating', r.rating, 'n', r.n)) from (
+      select rating, count(*)::integer as n from public.product_reviews where product_id = p.id and hidden_at is null group by rating
+    ) r), '[]'::jsonb),
+    'viewer', case when p_viewer_id is null then null else jsonb_build_object(
+      'wished', exists(select 1 from public.wishlist_items w where w.user_id = p_viewer_id and w.product_id = p.id),
+      'stock_alert', exists(select 1 from public.product_alerts a where a.user_id = p_viewer_id and a.product_id = p.id and a.kind = 'stock' and a.notified_at is null),
+      'price_alert', exists(select 1 from public.product_alerts a where a.user_id = p_viewer_id and a.product_id = p.id and a.kind = 'price' and a.notified_at is null),
+      'following', exists(select 1 from public.shop_follows f where f.user_id = p_viewer_id and f.shop_id = s.id),
+      'in_cart', (select coalesce(sum(c.qty), 0)::integer from public.cart_items c join public.product_variants v on v.id = c.variant_id where c.user_id = p_viewer_id and v.product_id = p.id and not c.saved_for_later)
+    ) end
+  )
+  from public.products p
+  join public.shops s on s.id = p.shop_id
+  join public.users u on u.id = s.owner_id
+  where p.id = p_product_id and s.deleted_at is null;
+$$;
+
+create or replace function public.papa_market_product_questions(p_product_id uuid, p_viewer_id uuid default null, p_limit integer default 30)
+returns table(id uuid, body text, answer text, answered_at timestamptz, created_at timestamptz, asker text, asker_username text, mine boolean)
+language sql stable security definer set search_path = '' as $$
+  select q.id, q.body, q.answer, q.answered_at, q.created_at, u.full_name, u.username, q.asker_id = p_viewer_id
+  from public.product_questions q join public.users u on u.id = q.asker_id
+  where q.product_id = p_product_id and q.hidden_at is null and u.status = 'active'
+  order by (q.answer is not null) desc, q.created_at desc limit least(100, greatest(1, coalesce(p_limit, 30)));
+$$;
+
+create or replace function public.papa_market_product_reviews(p_product_id uuid, p_viewer_id uuid default null, p_limit integer default 20)
+returns table(id uuid, rating integer, body text, created_at timestamptz, seller_reply text, name text, username text, avatar_url text, mine boolean)
+language sql stable security definer set search_path = '' as $$
+  select r.id, r.rating, r.body, r.created_at, r.seller_reply, u.full_name, u.username, u.avatar_url, r.user_id = p_viewer_id
+  from public.product_reviews r join public.users u on u.id = r.user_id
+  where r.product_id = p_product_id and r.hidden_at is null and u.status = 'active'
+  order by (r.user_id = p_viewer_id) desc, length(r.body) > 0 desc, r.created_at desc limit least(100, greatest(1, coalesce(p_limit, 20)));
+$$;
+
+create or replace function public.papa_market_order_detail(p_order_id uuid, p_viewer_id uuid, p_viewer_role text)
+returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select jsonb_build_object(
+    'order', to_jsonb(o),
+    'items', coalesce((select jsonb_agg(jsonb_build_object(
+      'id', i.id, 'product_id', i.product_id, 'title', i.title, 'variant_name', i.variant_name,
+      'image', i.image, 'unit_pesewas', i.unit_pesewas, 'qty', i.qty, 'total_pesewas', i.total_pesewas,
+      'my_rating', (select r.rating from public.product_reviews r where r.product_id = i.product_id and r.user_id = o.buyer_id)
+    ) order by i.total_pesewas desc) from public.market_order_items i where i.order_id = o.id), '[]'::jsonb),
+    'events', coalesce((select jsonb_agg(jsonb_build_object('id', e.id, 'kind', e.kind, 'note', e.note, 'created_at', e.created_at,
+      'actor', (select u.full_name from public.users u where u.id = e.actor_id)) order by e.created_at, e.id)
+      from public.market_order_events e where e.order_id = o.id), '[]'::jsonb),
+    'requests', coalesce((select jsonb_agg(to_jsonb(r) order by r.created_at desc) from public.market_requests r where r.order_id = o.id), '[]'::jsonb),
+    'shop', (select jsonb_build_object('slug', s.slug, 'logo_url', s.logo_url, 'phone', s.phone, 'return_days', s.return_days) from public.shops s where s.id = o.shop_id),
+    'people', coalesce((select jsonb_agg(jsonb_build_object('id', u.id, 'full_name', u.full_name, 'username', u.username, 'avatar_url', u.avatar_url))
+      from public.users u where u.id in (o.buyer_id, o.seller_id)), '[]'::jsonb),
+    'payment', (select jsonb_build_object('reference', p.reference, 'status', p.status::text, 'channel', p.channel::text)
+      from public.payments p where p.market_checkout_id = o.checkout_id order by p.created_at desc limit 1),
+    'delivery', (select jsonb_build_object('id', d.id, 'status', d.status::text, 'fee_pesewas', d.fee_pesewas,
+      'created_at', d.created_at, 'accepted_at', d.accepted_at, 'picked_up_at', d.picked_up_at, 'delivered_at', d.delivered_at,
+      'rider_name', u.full_name, 'rider_username', u.username, 'rider_phone', r.phone, 'rider_vehicle', r.vehicle, 'rider_user_id', r.user_id)
+      from public.deliveries d left join public.riders r on r.id = d.rider_id left join public.users u on u.id = r.user_id
+      where d.order_id = o.id and d.status <> 'cancelled' order by d.created_at desc limit 1),
+    'role', case when o.buyer_id = p_viewer_id then 'buyer' when o.seller_id = p_viewer_id then 'seller'
+      when p_viewer_role = 'tech_admin' then 'admin' else null end
+  )
+  from public.market_orders o
+  where o.id = p_order_id
+    and (o.buyer_id = p_viewer_id or o.seller_id = p_viewer_id or p_viewer_role = 'tech_admin')
+    and (o.paid_at is not null or o.buyer_id = p_viewer_id)
+    and (o.paid_at is not null or o.seller_id is distinct from p_viewer_id);
+$$;
+
+revoke all on function public.papa_market_product_detail(uuid, uuid) from public, anon, authenticated;
+revoke all on function public.papa_market_product_questions(uuid, uuid, integer) from public, anon, authenticated;
+revoke all on function public.papa_market_product_reviews(uuid, uuid, integer) from public, anon, authenticated;
+revoke all on function public.papa_market_order_detail(uuid, uuid, text) from public, anon, authenticated;
+grant execute on function public.papa_market_product_detail(uuid, uuid) to service_role;
+grant execute on function public.papa_market_product_questions(uuid, uuid, integer) to service_role;
+grant execute on function public.papa_market_product_reviews(uuid, uuid, integer) to service_role;
+grant execute on function public.papa_market_order_detail(uuid, uuid, text) to service_role;
+
+-- ===== 0058_market_order_lifecycle_remaining.sql =====
+create or replace function public.papa_market_order_detail(p_order_id uuid, p_viewer_id uuid, p_viewer_role text)
+returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select jsonb_build_object(
+    'order', to_jsonb(o),
+    'items', coalesce((select jsonb_agg(jsonb_build_object(
+      'id', i.id, 'product_id', i.product_id, 'title', i.title, 'variant_name', i.variant_name,
+      'image', i.image, 'unit_pesewas', i.unit_pesewas, 'qty', i.qty, 'total_pesewas', i.total_pesewas,
+      'my_rating', (select r.rating from public.product_reviews r where r.product_id = i.product_id and r.user_id = o.buyer_id)
+    ) order by i.total_pesewas desc) from public.market_order_items i where i.order_id = o.id), '[]'::jsonb),
+    'events', coalesce((select jsonb_agg(jsonb_build_object('id', e.id, 'kind', e.kind, 'note', e.note, 'created_at', e.created_at,
+      'actor', (select u.full_name from public.users u where u.id = e.actor_id)) order by e.created_at, e.id)
+      from public.market_order_events e where e.order_id = o.id), '[]'::jsonb),
+    'requests', coalesce((select jsonb_agg(to_jsonb(r) order by r.created_at desc) from public.market_requests r where r.order_id = o.id), '[]'::jsonb),
+    'shop', (select jsonb_build_object('slug', s.slug, 'logo_url', s.logo_url, 'phone', s.phone, 'return_days', s.return_days) from public.shops s where s.id = o.shop_id),
+    'people', coalesce((select jsonb_agg(jsonb_build_object('id', u.id, 'full_name', u.full_name, 'username', u.username, 'avatar_url', u.avatar_url))
+      from public.users u where u.id in (o.buyer_id, o.seller_id)), '[]'::jsonb),
+    'payment', (select jsonb_build_object('reference', p.reference, 'status', p.status::text, 'channel', p.channel::text)
+      from public.payments p where p.market_checkout_id = o.checkout_id order by p.created_at desc limit 1),
+    'delivery', (select jsonb_build_object('id', d.id, 'status', d.status::text, 'fee_pesewas', d.fee_pesewas,
+      'created_at', d.created_at, 'accepted_at', d.accepted_at, 'picked_up_at', d.picked_up_at, 'delivered_at', d.delivered_at,
+      'rider_name', u.full_name, 'rider_username', u.username, 'rider_phone', r.phone, 'rider_vehicle', r.vehicle, 'rider_user_id', r.user_id)
+      from public.deliveries d left join public.riders r on r.id = d.rider_id left join public.users u on u.id = r.user_id
+      where d.order_id = o.id and d.status <> 'cancelled' order by d.created_at desc limit 1),
+    'role', case when o.buyer_id = p_viewer_id then 'buyer' when o.seller_id = p_viewer_id then 'seller'
+      when p_viewer_role = 'tech_admin' then 'admin' else null end
+  )
+  from public.market_orders o
+  where o.id = p_order_id
+    and (o.buyer_id = p_viewer_id or o.seller_id = p_viewer_id or p_viewer_role = 'tech_admin')
+    and (o.paid_at is not null or o.buyer_id = p_viewer_id or p_viewer_role = 'tech_admin');
+$$;
+
+create or replace function public.papa_market_adjust_product_rating(p_product_id uuid, p_rating_delta integer, p_count_delta integer)
+returns boolean
+language plpgsql security definer set search_path = '' as $$
+begin
+  if p_rating_delta is null or p_count_delta is null or abs(p_rating_delta) > 5 or abs(p_count_delta) > 1 then return false; end if;
+  update public.products set rating_sum = greatest(0, rating_sum + p_rating_delta), rating_count = greatest(0, rating_count + p_count_delta)
+  where id = p_product_id;
+  return found;
+end;
+$$;
+
+create or replace function public.papa_market_reply_review(p_review_id uuid, p_user_id uuid, p_reply text)
+returns boolean
+language plpgsql security definer set search_path = '' as $$
+begin
+  update public.product_reviews r set seller_reply = left(p_reply, 1000), seller_reply_at = now()
+  from public.products p join public.shops s on s.id = p.shop_id
+  where r.id = p_review_id and p.id = r.product_id and s.owner_id = p_user_id;
+  return found;
+end;
+$$;
+
+create or replace function public.papa_market_hide_review(p_review_id uuid)
+returns boolean
+language plpgsql security definer set search_path = '' as $$
+declare
+  v_product_id uuid;
+  v_rating integer;
+begin
+  update public.product_reviews set hidden_at = now()
+  where id = p_review_id and hidden_at is null
+  returning product_id, rating into v_product_id, v_rating;
+  if not found then return false; end if;
+  update public.products set rating_sum = greatest(rating_sum - v_rating, 0), rating_count = greatest(rating_count - 1, 0)
+  where id = v_product_id;
+  return true;
+end;
+$$;
+
+revoke all on function public.papa_market_order_detail(uuid, uuid, text) from public, anon, authenticated;
+revoke all on function public.papa_market_adjust_product_rating(uuid, integer, integer) from public, anon, authenticated;
+revoke all on function public.papa_market_reply_review(uuid, uuid, text) from public, anon, authenticated;
+revoke all on function public.papa_market_hide_review(uuid) from public, anon, authenticated;
+grant execute on function public.papa_market_order_detail(uuid, uuid, text) to service_role;
+grant execute on function public.papa_market_adjust_product_rating(uuid, integer, integer) to service_role;
+grant execute on function public.papa_market_reply_review(uuid, uuid, text) to service_role;
+grant execute on function public.papa_market_hide_review(uuid) to service_role;

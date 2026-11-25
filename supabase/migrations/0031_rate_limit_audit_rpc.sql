@@ -19,7 +19,7 @@ begin
  where (nullif(p_action,'') is null or a.action ilike replace(replace(replace(p_action,'\','\\'),'%','\%'),'_','\_')||'%' escape '\')
  and (nullif(p_actor,'') is null or lower(coalesce(u.username,''))=lower(ltrim(p_actor,'@')))
  and (p_from is null or a.created_at>=p_from) and (p_to is null or a.created_at<=p_to);
- select coalesce(jsonb_agg(to_jsonb(x) order by x.created_at desc),'[]'::jsonb) into v_rows from (
+ select coalesce(jsonb_agg(to_jsonb(x) order by x."createdAt" desc),'[]'::jsonb) into v_rows from (
  select a.id,a.action,a.target,a.meta,a.ip,a.created_at as "createdAt",u.username,u.full_name as "fullName" from audit_log a left join users u on u.id=a.actor_id
  where (nullif(p_action,'') is null or a.action ilike replace(replace(replace(p_action,'\','\\'),'%','\%'),'_','\_')||'%' escape '\')
  and (nullif(p_actor,'') is null or lower(coalesce(u.username,''))=lower(ltrim(p_actor,'@')))

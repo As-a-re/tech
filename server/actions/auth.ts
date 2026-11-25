@@ -7,7 +7,10 @@ import { env } from '@/lib/env'
 import { signPayload, verifyPayload } from '@/lib/crypto'
 import { getLocale } from '@/lib/i18n/server'
 import { completeRegistration, startRegistration, verifyRegistrationCode } from '@/server/identity/register'
-import { login } from '@/server/identity/login'
+import { verifySupabaseCredentials } from '@/server/identity/login'
+import { normaliseChurchId, normalisePhone } from '@/lib/identity/normalise'
+import { hit, clear } from '@/server/identity/rate-limit'
+import { supabaseUserServer } from '@/lib/supabase/server'
 import { finishReset, startReset } from '@/server/identity/password-reset'
 import { sendCode } from '@/server/identity/codes'
 import { createSession, destroyCurrentSession, getCurrentUser, requestMeta } from '@/server/identity/session'
@@ -20,7 +23,7 @@ export type AuthState = { error?: string; fields?: Record<string, string>; notic
 const REG = 'papa_reg'
 const RESET = 'papa_reset'
 const TWO_FA = 'papa_2fa'
-type TwoFaTicket = { userId: string; next: string }
+type TwoFaTicket = { userId: string; phone: string; next: string }
 type RegTicket = { churchId: string; phone: string; verified: boolean }
 type ResetTicket = { userId: string | null; phone: string | null }
 
@@ -79,6 +82,11 @@ export async function registerComplete(_: AuthState, form: FormData): Promise<Au
     return field ? { fields: { [field]: ('error' in r ? r.error : 'unknown') }, values: { username: str(form, 'username') } } : { error: ('error' in r ? r.error : 'unknown') }
   }
   ;(await cookies()).delete(REG)
+  const auth = await supabaseUserServer()
+  const { error: signInError } = await auth.auth.signInWithPassword({ phone: t.phone, password: str(form, 'password') })
+  if (signInError) {
+    redirect('/login?notice=account_created')
+  }
   await createSession(r.userId)
   redirect('/welcome')
 }
@@ -86,14 +94,44 @@ export async function registerComplete(_: AuthState, form: FormData): Promise<Au
 /* ───────── Sign in / out ───────── */
 
 export async function signIn(_: AuthState, form: FormData): Promise<AuthState> {
+  const identifier = str(form, 'identifier').trim()
+  const password = str(form, 'password')
   const { ip } = await requestMeta()
-  const r = await login(str(form, 'identifier'), str(form, 'password'), ip)
-  if (!r.ok) return { error: ('error' in r ? r.error : 'unknown') === 'invalid' ? 'login_invalid' : ('error' in r ? r.error : 'unknown'), values: { identifier: str(form, 'identifier') } }
-  if (await twoFactorEnabled(r.userId)) {
-    ;(await cookies()).set(TWO_FA, signPayload({ userId: r.userId, next: safeNext(form.get('next')) } satisfies TwoFaTicket, env.authSecret, 5 * 60), cookieOpts(5 * 60))
+  if (!identifier || !password) return { error: 'missing', values: { identifier } }
+  const loginKey = identifier.toLowerCase()
+  if (!(await hit(`login:id:${loginKey}`, 10, 900)) || !(await hit(`login:ip:${ip ?? 'unknown'}`, 50, 900))) return { error: 'too_many', values: { identifier } }
+
+  const phone = normalisePhone(identifier)
+  const safeIdentifier = identifier.replace(/^@/, '').replace(/[%,()]/g, '')
+  let accountQuery = createSupabaseAdminClient().from('users').select('id,auth_user_id,phone,status,church_id').limit(1)
+  accountQuery = phone.length === 12
+    ? accountQuery.or(`church_id.eq.${normaliseChurchId(identifier)},username.ilike.${safeIdentifier},phone.eq.${phone}`)
+    : accountQuery.or(`church_id.eq.${normaliseChurchId(identifier)},username.ilike.${safeIdentifier}`)
+  const { data: account, error: accountError } = await accountQuery.maybeSingle()
+  if (accountError) throw new Error(`Unable to look up account: ${accountError.message}`)
+  if (!account?.auth_user_id) return { error: 'login_invalid', values: { identifier } }
+
+  const authUser = await verifySupabaseCredentials(account.phone, password)
+  if (!authUser || authUser.id !== account.auth_user_id) {
+    await audit('account.login_failed', { target: identifier.slice(0, 40), ip })
+    return { error: 'login_invalid', values: { identifier } }
+  }
+  if (account.status === 'suspended') return { error: 'suspended', values: { identifier } }
+  const { data: member, error: memberError } = await createSupabaseAdminClient().from('church_members').select('active').eq('church_id', account.church_id).maybeSingle()
+  if (memberError) throw new Error(`Unable to check church membership: ${memberError.message}`)
+  if (!member?.active) return { error: 'inactive', values: { identifier } }
+
+  if (await twoFactorEnabled(account.id)) {
+    ;(await cookies()).set(TWO_FA, signPayload({ userId: account.id, phone: account.phone, next: safeNext(form.get('next')) } satisfies TwoFaTicket, env.authSecret, 5 * 60), cookieOpts(5 * 60))
     redirect('/login/verify')
   }
-  await createSession(r.userId)
+
+  const auth = await supabaseUserServer()
+  const { data: session, error: signInError } = await auth.auth.signInWithPassword({ phone: account.phone, password })
+  if (signInError || session.user?.id !== account.auth_user_id) return { error: 'login_invalid', values: { identifier } }
+  await clear(`login:id:${loginKey}`)
+  await audit('account.login', { actorId: account.id, ip })
+  await createSession(account.id)
   const me = await getCurrentUser()
   redirect(me && !me.onboarded ? '/welcome' : safeNext(form.get('next')))
 }
@@ -107,8 +145,19 @@ export async function readTwoFaTicket() {
 export async function verifySecondStep(_: AuthState, form: FormData): Promise<AuthState> {
   const t = await readTwoFaTicket()
   if (!t) return { error: 'session_expired' }
+  const { data: account, error: accountError } = await createSupabaseAdminClient().from('users').select('auth_user_id,status,church_id').eq('id', t.userId).maybeSingle()
+  if (accountError) throw new Error(`Unable to look up account: ${accountError.message}`)
+  const authUser = await verifySupabaseCredentials(t.phone, str(form, 'password'))
+  if (!account?.auth_user_id || !authUser || authUser.id !== account.auth_user_id) return { error: 'login_invalid' }
+  if (account.status === 'suspended') return { error: 'suspended' }
+  const { data: member, error: memberError } = await createSupabaseAdminClient().from('church_members').select('active').eq('church_id', account.church_id).maybeSingle()
+  if (memberError) throw new Error(`Unable to check church membership: ${memberError.message}`)
+  if (!member?.active) return { error: 'inactive' }
   const r = await checkSecondFactor(t.userId, str(form, 'code').trim())
   if (r !== 'ok') return { error: r === 'too_many' ? 'too_many' : 'code_wrong' }
+  const auth = await supabaseUserServer()
+  const { data: signedIn, error: signInError } = await auth.auth.signInWithPassword({ phone: t.phone, password: str(form, 'password') })
+  if (signInError || signedIn.user?.id !== account.auth_user_id) return { error: 'login_invalid' }
   ;(await cookies()).delete(TWO_FA)
   await createSession(t.userId)
   await audit('account.login_2fa', { actorId: t.userId, ip: (await requestMeta()).ip })
@@ -147,6 +196,10 @@ export async function resetFinish(_: AuthState, form: FormData): Promise<AuthSta
     return { fields: { [field]: ('error' in r ? r.error : 'unknown') } }
   }
   ;(await cookies()).delete(RESET)
+  if (!t.phone) return { error: 'session_expired' }
+  const auth = await supabaseUserServer()
+  const { error: signInError } = await auth.auth.signInWithPassword({ phone: t.phone, password: str(form, 'password') })
+  if (signInError) return { error: 'login_invalid' }
   await createSession(r.userId)
   redirect('/?notice=password_reset')
 }
