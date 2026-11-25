@@ -340,23 +340,26 @@ export async function myAlerts(userId: string) {
 export async function fireStockAlerts(productId: string) {
   const p = await visibleProduct(productId)
   if (!p) return 0
-  const inStock = await db.execute(sql`select 1 from product_variants v where v.product_id = ${productId} and v.active and v.stock > 0`)
-  if (!inStock.rows.length) return 0
-  const due = await db.update(schema.productAlerts).set({ notifiedAt: sql`now()` })
-    .where(and(eq(schema.productAlerts.productId, productId), eq(schema.productAlerts.kind, 'stock'), isNull(schema.productAlerts.notifiedAt))).returning({ userId: schema.productAlerts.userId })
-  for (const a of due) await notify(a.userId, 'market_alert', null, null, { productId }).catch(() => {})
-  return due.length
+  const client = createSupabaseAdminClient()
+  const { data: variants, error: stockError } = await client.from('product_variants').select('id').eq('product_id', productId).eq('active', true).gt('stock', 0).limit(1)
+  if (stockError) throw new Error(`Unable to check product stock: ${stockError.message}`)
+  if (!variants?.length) return 0
+  const { data: due, error } = await client.from('product_alerts').update({ notified_at: new Date().toISOString() })
+    .eq('product_id', productId).eq('kind', 'stock').is('notified_at', null).select('user_id')
+  if (error) throw new Error(`Unable to notify stock alerts: ${error.message}`)
+  for (const a of due ?? []) await notify(a.user_id, 'market_alert', null, null, { productId }).catch(() => {})
+  return due?.length ?? 0
 }
 
 /** Call after a price change: members whose alert price is now beaten are told once. */
 export async function firePriceAlerts(productId: string) {
   const p = await visibleProduct(productId)
   if (!p) return 0
-  const due = await db.update(schema.productAlerts).set({ notifiedAt: sql`now()` })
-    .where(and(eq(schema.productAlerts.productId, productId), eq(schema.productAlerts.kind, 'price'), isNull(schema.productAlerts.notifiedAt), sql`${schema.productAlerts.pricePesewas} > ${p.price}`))
-    .returning({ userId: schema.productAlerts.userId })
-  for (const a of due) await notify(a.userId, 'market_alert', null, null, { productId }).catch(() => {})
-  return due.length
+  const { data: due, error } = await createSupabaseAdminClient().from('product_alerts').update({ notified_at: new Date().toISOString() })
+    .eq('product_id', productId).eq('kind', 'price').is('notified_at', null).gt('price_pesewas', p.price).select('user_id')
+  if (error) throw new Error(`Unable to notify price alerts: ${error.message}`)
+  for (const a of due ?? []) await notify(a.user_id, 'market_alert', null, null, { productId }).catch(() => {})
+  return due?.length ?? 0
 }
 
 /* ───────── Questions ───────── */
@@ -404,6 +407,8 @@ export async function suggestProducts(q: string, limit = 3) {
 
 /** The member's open shop (for their profile). */
 export async function shopOf(userId: string) {
-  const r = await db.execute<{ slug: string; name: string }>(sql`select slug, name from shops where owner_id = ${userId} and deleted_at is null and status = 'active' limit 1`)
-  return r.rows[0] ?? null
+  const { data, error } = await createSupabaseAdminClient().from('shops').select('slug,name')
+    .eq('owner_id', userId).is('deleted_at', null).eq('status', 'active').limit(1).maybeSingle()
+  if (error) throw new Error(`Unable to load member shop: ${error.message}`)
+  return data
 }
