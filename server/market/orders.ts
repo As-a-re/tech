@@ -24,13 +24,7 @@ export type OrderRow = {
   id: string; number: string; shopName: string; shopSlug: string | null; status: OrderStatus; fulfilment: 'delivery' | 'pickup'; totalPesewas: number; createdAt: string
   itemCount: number; firstTitle: string; images: string[]; buyerName: string | null; openRequest: string | null
 }
-const ROW_SQL = sql.raw(`o.id, o.number, o.shop_name, (select s.slug from shops s where s.id = o.shop_id) as shop_slug, o.status, o.fulfilment, o.total_pesewas, o.created_at,
-  (select coalesce(sum(i.qty), 0)::int from market_order_items i where i.order_id = o.id) as item_count,
-  (select i.title from market_order_items i where i.order_id = o.id order by i.total_pesewas desc limit 1) as first_title,
-  (select coalesce(json_agg(x.image), '[]'::json) from (select i.image from market_order_items i where i.order_id = o.id and i.image is not null limit 3) x) as images,
-  (select u.full_name from users u where u.id = o.buyer_id) as buyer_name,
-  (select r.kind::text from market_requests r where r.order_id = o.id and r.status = 'open' limit 1) as open_request`)
-type RawRow = { id: string; number: string; shop_name: string; shop_slug: string | null; status: OrderStatus; fulfilment: 'delivery' | 'pickup'; total_pesewas: number; created_at: Date; item_count: number; first_title: string; images: string[]; buyer_name: string | null; open_request: string | null }
+type RawRow = { id: string; number: string; shop_name: string; shop_slug: string | null; status: OrderStatus; fulfilment: 'delivery' | 'pickup'; total_pesewas: number; created_at: Date; item_count: number; first_title: string | null; images: string[]; buyer_name: string | null; open_request: string | null }
 const toRow = (r: RawRow): OrderRow => ({ id: r.id, number: r.number, shopName: r.shop_name, shopSlug: r.shop_slug, status: r.status, fulfilment: r.fulfilment, totalPesewas: r.total_pesewas,
   createdAt: iso(r.created_at)!, itemCount: r.item_count, firstTitle: r.first_title ?? '', images: r.images ?? [], buyerName: r.buyer_name, openRequest: r.open_request })
 
@@ -39,18 +33,25 @@ export type OrderTab = (typeof ORDER_TABS)[number]
 
 /** My orders as a buyer. Unpaid (or failed) checkouts show for 2 hours only. */
 export async function myOrders(userId: string, tab: OrderTab = 'all') {
-  const f = { all: sql`true`, active: sql`o.status in ('paid', 'accepted', 'packed', 'shipped')`, delivered: sql`o.status in ('delivered', 'completed')`, cancelled: sql`o.status = 'cancelled'` }[tab]
-  const r = await db.execute<RawRow>(sql`select ${ROW_SQL} from market_orders o where o.buyer_id = ${userId}
-    and (o.paid_at is not null or o.created_at > now() - interval '2 hours') and ${f} order by o.created_at desc limit 200`)
-  return r.rows.map(toRow)
+  const { data, error } = await createSupabaseAdminClient().rpc('papa_market_order_list', {
+    p_user_id: userId,
+    p_seller: false,
+    p_filter: tab,
+  })
+  if (error) throw new Error(`Unable to load market orders: ${error.message}`)
+  return ((data ?? []) as RawRow[]).map(toRow)
 }
 
 /** Orders to a shop (the seller's list; the full seller dashboard comes in Batch 17). */
 export async function shopOrders(user: Who, status?: string) {
-  const st = (['paid', 'accepted', 'packed', 'shipped', 'delivered', 'completed', 'cancelled'] as const).find((s) => s === status)
-  const r = await db.execute<RawRow>(sql`select ${ROW_SQL} from market_orders o where o.seller_id = ${user.id} and o.paid_at is not null
-    ${st ? sql`and o.status = ${st}` : sql``} order by o.created_at desc limit 200`)
-  return r.rows.map(toRow)
+  const st = (['paid', 'accepted', 'packed', 'shipped', 'delivered', 'completed', 'cancelled'] as const).find((s) => s === status) ?? null
+  const { data, error } = await createSupabaseAdminClient().rpc('papa_market_order_list', {
+    p_user_id: user.id,
+    p_seller: true,
+    p_filter: st,
+  })
+  if (error) throw new Error(`Unable to load shop orders: ${error.message}`)
+  return ((data ?? []) as RawRow[]).map(toRow)
 }
 
 /* ───────── One order ───────── */

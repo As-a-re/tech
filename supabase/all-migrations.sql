@@ -3953,3 +3953,77 @@ revoke all on function public.papa_market_cart_snapshot(uuid) from public, anon,
 revoke all on function public.papa_market_variant_info(uuid) from public, anon, authenticated;
 grant execute on function public.papa_market_cart_snapshot(uuid) to service_role;
 grant execute on function public.papa_market_variant_info(uuid) to service_role;
+
+-- ===== 0055_market_order_list_rpc.sql =====
+create or replace function public.papa_market_order_list(p_user_id uuid, p_seller boolean default false, p_filter text default null)
+returns table (
+  id uuid, number text, shop_name text, shop_slug text, status text, fulfilment text, total_pesewas integer,
+  created_at timestamptz, item_count integer, first_title text, images text[], buyer_name text, open_request text
+)
+language sql stable security definer set search_path = '' as $$
+  select o.id, o.number, o.shop_name, s.slug, o.status::text, o.fulfilment::text, o.total_pesewas, o.created_at,
+    coalesce((select sum(i.qty)::integer from public.market_order_items i where i.order_id = o.id), 0),
+    (select i.title from public.market_order_items i where i.order_id = o.id order by i.total_pesewas desc limit 1),
+    coalesce((select array_agg(x.image) from (select i.image from public.market_order_items i where i.order_id = o.id and i.image is not null limit 3) x), array[]::text[]),
+    (select u.full_name from public.users u where u.id = o.buyer_id),
+    (select r.kind::text from public.market_requests r where r.order_id = o.id and r.status = 'open' limit 1)
+  from public.market_orders o
+  left join public.shops s on s.id = o.shop_id
+  where (case when coalesce(p_seller, false) then o.seller_id else o.buyer_id end) = p_user_id
+    and (
+      (coalesce(p_seller, false) and o.paid_at is not null)
+      or (not coalesce(p_seller, false) and (o.paid_at is not null or o.created_at > now() - interval '2 hours'))
+    )
+    and (
+      p_filter is null or p_filter = 'all'
+      or (not coalesce(p_seller, false) and p_filter = 'active' and o.status in ('paid', 'accepted', 'packed', 'shipped'))
+      or (not coalesce(p_seller, false) and p_filter = 'delivered' and o.status in ('delivered', 'completed'))
+      or (not coalesce(p_seller, false) and p_filter = 'cancelled' and o.status = 'cancelled')
+      or (coalesce(p_seller, false) and o.status::text = p_filter)
+    )
+  order by o.created_at desc, o.id desc
+  limit 200;
+$$;
+revoke all on function public.papa_market_order_list(uuid, boolean, text) from public, anon, authenticated;
+grant execute on function public.papa_market_order_list(uuid, boolean, text) to service_role;
+
+-- ===== 0056_market_catalog_member_cards_rpc.sql =====
+create or replace function public.papa_market_catalog_member_cards(
+  p_user_id uuid,
+  p_kind text,
+  p_shop_id uuid default null,
+  p_limit integer default 24
+)
+returns table (
+  id uuid, title text, image text, price integer, was integer, rating_sum integer, rating_count integer, sold integer,
+  in_stock boolean, condition text, category text, shop_name text, shop_slug text, town text
+)
+language sql stable security definer set search_path = '' as $$
+  select p.id, p.title, p.images ->> 0, p.price_pesewas,
+    case when p.compare_at_pesewas > p.price_pesewas and (p.deal_ends_at is null or p.deal_ends_at > now()) then p.compare_at_pesewas end,
+    p.rating_sum, p.rating_count, p.sold_count,
+    exists (select 1 from public.product_variants v where v.product_id = p.id and v.active and v.stock > 0),
+    p.condition::text, p.category::text, s.name, s.slug, s.town
+  from public.products p
+  join public.shops s on s.id = p.shop_id
+  join public.users u on u.id = s.owner_id
+  left join public.recently_viewed rv on p_kind = 'recent' and rv.product_id = p.id and rv.user_id = p_user_id
+  left join public.wishlist_items w on p_kind = 'wishlist' and w.product_id = p.id and w.user_id = p_user_id
+  left join public.shop_follows f on p_kind = 'followed' and f.shop_id = p.shop_id and f.user_id = p_user_id
+  where p.status = 'active' and p.deleted_at is null and s.status = 'active' and s.deleted_at is null and u.status = 'active'
+    and (
+      (p_kind = 'recent' and rv.product_id is not null)
+      or (p_kind = 'wishlist' and w.product_id is not null)
+      or (p_kind = 'followed' and f.shop_id is not null and p.created_at > now() - interval '60 days')
+      or (p_kind = 'shop' and p.shop_id = p_shop_id)
+    )
+  order by
+    case when p_kind = 'recent' then rv.viewed_at end desc,
+    case when p_kind = 'wishlist' then w.created_at end desc,
+    case when p_kind = 'followed' then p.created_at end desc,
+    case when p_kind = 'shop' then p.created_at end desc,
+    p.id
+  limit least(500, greatest(1, coalesce(p_limit, 24)));
+$$;
+revoke all on function public.papa_market_catalog_member_cards(uuid, text, uuid, integer) from public, anon, authenticated;
+grant execute on function public.papa_market_catalog_member_cards(uuid, text, uuid, integer) to service_role;

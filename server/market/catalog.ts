@@ -93,21 +93,22 @@ export async function marketHome(viewer: { id: string; districtId?: string | nul
       for (const p of more.items) if (!seen.has(p.id) && recommended.length < 12) { recommended.push(p); seen.add(p.id) }
     }
     if (viewer.districtId) near = (await listProducts({ districtId: viewer.districtId, sort: 'popular', limit: 12 })).items
-    const followed = await db.execute<{ id: string }>(sql`select f.shop_id as id from shop_follows f where f.user_id = ${viewer.id}`)
-    if (followed.rows.length) {
-      const items = await db.execute<CardRow>(sql`select ${CARD_COLS} ${FROM} where ${VISIBLE_SQL} and p.shop_id in ${followed.rows.map((x) => x.id)}
-        and p.created_at > now() - interval '60 days' order by p.created_at desc limit 12`)
-      fromFollowed = items.rows.map(toCard)
-    }
+    const { data: followed, error: followedError } = await createSupabaseAdminClient().rpc('papa_market_catalog_member_cards', {
+      p_user_id: viewer.id, p_kind: 'followed', p_limit: 12,
+    })
+    if (followedError) throw new Error(`Unable to load followed-shop products: ${followedError.message}`)
+    fromFollowed = ((followed ?? []) as CardRow[]).map(toCard)
     for (const p of popular.items) if (recommended.length < 8 && !seen.has(p.id)) { recommended.push(p); seen.add(p.id) }
   }
   return { deals: deals.items, fresh: fresh.items, popular: popular.items, recent, recommended, fromFollowed, near, categories: await categoryCounts() }
 }
 
 export async function recentlyViewedCards(userId: string, limit = 24) {
-  const r = await db.execute<CardRow>(sql`select ${CARD_COLS} ${FROM} join recently_viewed rv on rv.product_id = p.id and rv.user_id = ${userId}
-    where ${VISIBLE_SQL} order by rv.viewed_at desc limit ${limit}`)
-  return r.rows.map(toCard)
+  const { data, error } = await createSupabaseAdminClient().rpc('papa_market_catalog_member_cards', {
+    p_user_id: userId, p_kind: 'recent', p_limit: Math.min(200, Math.max(1, limit)),
+  })
+  if (error) throw new Error(`Unable to load recently viewed products: ${error.message}`)
+  return ((data ?? []) as CardRow[]).map(toCard)
 }
 
 /* ───────── Product page ───────── */
@@ -305,9 +306,11 @@ export async function setWishlist(user: Who, productId: string, on: boolean) {
 }
 
 export async function wishlist(userId: string) {
-  const r = await db.execute<CardRow>(sql`select ${CARD_COLS} ${FROM} join wishlist_items w on w.product_id = p.id and w.user_id = ${userId}
-    where ${VISIBLE_SQL} order by w.created_at desc limit 500`)
-  return r.rows.map(toCard)
+  const { data, error } = await createSupabaseAdminClient().rpc('papa_market_catalog_member_cards', {
+    p_user_id: userId, p_kind: 'wishlist', p_limit: 500,
+  })
+  if (error) throw new Error(`Unable to load saved products: ${error.message}`)
+  return ((data ?? []) as CardRow[]).map(toCard)
 }
 
 /* ───────── Alerts: back in stock, price drop ───────── */
