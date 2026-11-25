@@ -225,4 +225,24 @@ integration('Supabase migration RPC integration (read-only/safe probes)', () => 
     expect(result.error?.message).toContain('shop_not_found')
   })
 
+  it('exposes product and order detail RPCs and review helpers for nonexistent IDs', async () => {
+    const [product, questions, reviews, order, rating, reply, hidden] = await Promise.all([
+      client.rpc('papa_market_product_detail', { p_product_id: missingId, p_viewer_id: missingId }),
+      client.rpc('papa_market_product_questions', { p_product_id: missingId, p_viewer_id: missingId, p_limit: 10 }),
+      client.rpc('papa_market_product_reviews', { p_product_id: missingId, p_viewer_id: missingId, p_limit: 10 }),
+      client.rpc('papa_market_order_detail', { p_order_id: missingId, p_viewer_id: missingId, p_viewer_role: 'member' }),
+      client.rpc('papa_market_adjust_product_rating', { p_product_id: missingId, p_rating_delta: 0, p_count_delta: 0 }),
+      client.rpc('papa_market_reply_review', { p_review_id: missingId, p_user_id: missingId, p_reply: 'probe' }),
+      client.rpc('papa_market_hide_review', { p_review_id: missingId }),
+    ])
+    for (const result of [product, questions, reviews, order, rating, reply, hidden]) expect(result.error).toBeNull()
+    expect(product.data).toBeNull()
+    expect(Array.isArray(questions.data)).toBe(true)
+    expect(Array.isArray(reviews.data)).toBe(true)
+    expect(order.data).toBeNull()
+    expect(rating.data).toBe(false)
+    expect(reply.data).toBe(false)
+    expect(hidden.data).toBe(false)
+  })
+
 })

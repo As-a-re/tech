@@ -118,39 +118,36 @@ export type ReviewView = { id: string; rating: number; body: string; createdAt: 
 
 export async function getProduct(id: string, viewer: Who | null) {
   if (!isId(id)) return null
-  const r = await db.execute<{
-    id: string; title: string; description: string; category: string; condition: ProductCard['condition']; images: string[]; option_names: string[]; price: number
-    compare_at: number | null; deal_ends_at: Date | null; rating_sum: number; rating_count: number; sold: number; status: 'active' | 'draft' | 'removed'; created_at: Date; deleted: boolean
-    shop_id: string; shop_name: string; shop_slug: string; shop_logo: string | null; shop_town: string | null; shop_status: string; owner_id: string; owner_status: string
-    owner_username: string; owner_name: string; offers_pickup: boolean; offers_delivery: boolean; delivery_fee: number; free_over: number | null; delivery_note: string | null
-    pickup_address: string | null; return_days: number; shop_verified: boolean; assembly_name: string | null
-  }>(sql`select p.id, p.title, p.description, p.category, p.condition, p.images, p.option_names, p.price_pesewas as price, p.compare_at_pesewas as compare_at, p.deal_ends_at,
-      p.rating_sum, p.rating_count, p.sold_count as sold, p.status, p.created_at, p.deleted_at is not null as deleted,
-      s.id as shop_id, s.name as shop_name, s.slug as shop_slug, s.logo_url as shop_logo, s.town as shop_town, s.status as shop_status, s.owner_id, u.status as owner_status,
-      u.username as owner_username, u.full_name as owner_name, s.offers_pickup, s.offers_delivery, s.delivery_fee_pesewas as delivery_fee, s.free_delivery_over_pesewas as free_over,
-      s.delivery_note, s.pickup_address, s.return_days, s.verified_at is not null as shop_verified, (select a.name from assemblies a where a.id = s.assembly_id) as assembly_name
-    from products p join shops s on s.id = p.shop_id join users u on u.id = s.owner_id where p.id = ${id} and s.deleted_at is null`)
-  const p = r.rows[0]
-  if (!p || p.deleted) return null
+  const { data, error } = await createSupabaseAdminClient().rpc('papa_market_product_detail', {
+    p_product_id: id, p_viewer_id: viewer?.id ?? null,
+  })
+  if (error) throw new Error(`Unable to load market product: ${error.message}`)
+  if (!data) return null
+  const result = data as {
+    product: {
+      id: string; title: string; description: string; category: string; condition: ProductCard['condition']; images: string[]; option_names: string[]; price: number
+      compare_at: number | null; deal_ends_at: string | null; rating_sum: number; rating_count: number; sold: number; status: 'active' | 'draft' | 'removed'; created_at: string; deleted: boolean
+      shop_id: string; shop_name: string; shop_slug: string; shop_logo: string | null; shop_town: string | null; shop_status: string; owner_id: string; owner_status: string
+      owner_username: string; owner_name: string; offers_pickup: boolean; offers_delivery: boolean; delivery_fee: number; free_over: number | null; delivery_note: string | null
+      pickup_address: string | null; return_days: number; shop_verified: boolean; assembly_name: string | null
+    }
+    variants: Variant[]; stars: { rating: number; n: number }[]
+    viewer: { wished: boolean; stock_alert: boolean; price_alert: boolean; following: boolean; in_cart: number } | null
+  }
+  const p = result.product
+  if (p.deleted) return null
   const isOwner = viewer?.id === p.owner_id
   const isAdmin = viewer?.role === 'tech_admin'
   const visible = p.status === 'active' && p.shop_status === 'active' && p.owner_status === 'active'
   if (!visible && !isOwner && !isAdmin) return null
-  const variants = await db.select({ id: schema.productVariants.id, name: schema.productVariants.name, options: schema.productVariants.options, pricePesewas: schema.productVariants.pricePesewas, stock: schema.productVariants.stock })
-    .from(schema.productVariants).where(and(eq(schema.productVariants.productId, id), eq(schema.productVariants.active, true))).orderBy(schema.productVariants.position, schema.productVariants.pricePesewas)
-  const stars = await db.execute<{ rating: number; n: number }>(sql`select rating, count(*)::int as n from product_reviews where product_id = ${id} and hidden_at is null group by 1`)
-  const [flags] = viewer ? (await db.execute<{ wished: boolean; stock_alert: boolean; price_alert: boolean; following: boolean; in_cart: number }>(sql`select
-      exists (select 1 from wishlist_items w where w.user_id = ${viewer.id} and w.product_id = ${id}) as wished,
-      exists (select 1 from product_alerts a where a.user_id = ${viewer.id} and a.product_id = ${id} and a.kind = 'stock' and a.notified_at is null) as stock_alert,
-      exists (select 1 from product_alerts a where a.user_id = ${viewer.id} and a.product_id = ${id} and a.kind = 'price' and a.notified_at is null) as price_alert,
-      exists (select 1 from shop_follows f where f.user_id = ${viewer.id} and f.shop_id = ${p.shop_id}) as following,
-      (select coalesce(sum(c.qty), 0)::int from cart_items c join product_variants v on v.id = c.variant_id where c.user_id = ${viewer.id} and v.product_id = ${id} and not c.saved_for_later) as in_cart`)).rows : []
-  const dealOn = !!p.compare_at && p.compare_at > p.price && (!p.deal_ends_at || p.deal_ends_at > new Date())
+  const variants = result.variants
+  const flags = result.viewer
+  const dealOn = !!p.compare_at && p.compare_at > p.price && (!p.deal_ends_at || new Date(p.deal_ends_at) > new Date())
   return {
     id: p.id, title: p.title, description: p.description, category: p.category, condition: p.condition, images: p.images, optionNames: p.option_names,
     pricePesewas: p.price, compareAtPesewas: dealOn ? p.compare_at : null, dealEndsAt: dealOn ? iso(p.deal_ends_at) : null,
     rating: p.rating_count ? Math.round((p.rating_sum / p.rating_count) * 10) / 10 : null, ratingCount: p.rating_count, soldCount: p.sold, status: p.status, visible, createdAt: iso(p.created_at)!,
-    stars: [5, 4, 3, 2, 1].map((n) => ({ n, count: stars.rows.find((x) => x.rating === n)?.n ?? 0 })),
+    stars: [5, 4, 3, 2, 1].map((n) => ({ n, count: result.stars.find((x) => x.rating === n)?.n ?? 0 })),
     variants, inStock: variants.some((v) => v.stock > 0), stockTotal: variants.reduce((a, v) => a + v.stock, 0),
     shop: {
       id: p.shop_id, name: p.shop_name, slug: p.shop_slug, logoUrl: p.shop_logo, town: p.shop_town, assemblyName: p.assembly_name, verified: p.shop_verified, ownerId: p.owner_id,
@@ -176,19 +173,21 @@ export async function clearRecentlyViewed(userId: string) {
 }
 
 export async function listQuestions(productId: string, viewerId: string | null, limit = 30): Promise<QuestionView[]> {
-  const r = await db.execute<{ id: string; body: string; answer: string | null; answered_at: Date | null; created_at: Date; asker: string; asker_username: string; asker_id: string }>(sql`
-    select q.id, q.body, q.answer, q.answered_at, q.created_at, u.full_name as asker, u.username as asker_username, q.asker_id
-    from product_questions q join users u on u.id = q.asker_id where q.product_id = ${productId} and q.hidden_at is null and u.status = 'active'
-    order by (q.answer is not null) desc, q.created_at desc limit ${limit}`)
-  return r.rows.map((q) => ({ id: q.id, body: q.body, answer: q.answer, answeredAt: iso(q.answered_at), createdAt: iso(q.created_at)!, asker: q.asker, askerUsername: q.asker_username, mine: q.asker_id === viewerId }))
+  const { data, error } = await createSupabaseAdminClient().rpc('papa_market_product_questions', {
+    p_product_id: productId, p_viewer_id: viewerId, p_limit: Math.min(100, Math.max(1, limit)),
+  })
+  if (error) throw new Error(`Unable to load product questions: ${error.message}`)
+  return ((data ?? []) as { id: string; body: string; answer: string | null; answered_at: string | null; created_at: string; asker: string; asker_username: string; mine: boolean | null }[])
+    .map((q) => ({ id: q.id, body: q.body, answer: q.answer, answeredAt: iso(q.answered_at), createdAt: iso(q.created_at)!, asker: q.asker, askerUsername: q.asker_username, mine: !!q.mine }))
 }
 
 export async function listReviews(productId: string, viewerId: string | null, limit = 20): Promise<ReviewView[]> {
-  const r = await db.execute<{ id: string; rating: number; body: string; created_at: Date; seller_reply: string | null; name: string; username: string; avatar_url: string | null; user_id: string }>(sql`
-    select r.id, r.rating, r.body, r.created_at, r.seller_reply, u.full_name as name, u.username, u.avatar_url, r.user_id
-    from product_reviews r join users u on u.id = r.user_id where r.product_id = ${productId} and r.hidden_at is null and u.status = 'active'
-    order by (r.user_id = ${viewerId ?? '00000000-0000-0000-0000-000000000000'}) desc, length(r.body) > 0 desc, r.created_at desc limit ${limit}`)
-  return r.rows.map((x) => ({ id: x.id, rating: x.rating, body: x.body, createdAt: iso(x.created_at)!, sellerReply: x.seller_reply, name: x.name, username: x.username, avatarUrl: x.avatar_url, mine: x.user_id === viewerId }))
+  const { data, error } = await createSupabaseAdminClient().rpc('papa_market_product_reviews', {
+    p_product_id: productId, p_viewer_id: viewerId, p_limit: Math.min(100, Math.max(1, limit)),
+  })
+  if (error) throw new Error(`Unable to load product reviews: ${error.message}`)
+  return ((data ?? []) as { id: string; rating: number; body: string; created_at: string; seller_reply: string | null; name: string; username: string; avatar_url: string | null; mine: boolean | null }[])
+    .map((x) => ({ id: x.id, rating: x.rating, body: x.body, createdAt: iso(x.created_at)!, sellerReply: x.seller_reply, name: x.name, username: x.username, avatarUrl: x.avatar_url, mine: !!x.mine }))
 }
 
 /* ───────── Shops ───────── */

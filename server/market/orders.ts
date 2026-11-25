@@ -1,6 +1,5 @@
 import 'server-only'
-import { and, desc, eq, sql } from 'drizzle-orm'
-import { db, schema } from '@/db'
+import { schema } from '@/db'
 import { hit } from '@/server/identity/rate-limit'
 import { notify } from '@/server/notifications/notify'
 import { refundPayment } from '@/integrations/payments'
@@ -57,46 +56,56 @@ export async function shopOrders(user: Who, status?: string) {
 /* ───────── One order ───────── */
 export async function getOrder(user: Who, id: string) {
   if (!isId(id)) return null
-  const [o] = await db.select().from(schema.marketOrders).where(eq(schema.marketOrders.id, id))
-  if (!o) return null
-  const role = o.buyerId === user.id ? 'buyer' : o.sellerId === user.id ? 'seller' : user.role === 'tech_admin' ? 'admin' : null
-  // Sellers only see orders that were paid
-  if (!role || (!o.paidAt && role === 'seller')) return null
-  const items = await db.execute<{ id: string; product_id: string | null; title: string; variant_name: string; image: string | null; unit_pesewas: number; qty: number; total_pesewas: number; my_rating: number | null }>(sql`
-    select i.id, i.product_id, i.title, i.variant_name, i.image, i.unit_pesewas, i.qty, i.total_pesewas,
-      (select r.rating from product_reviews r where r.product_id = i.product_id and r.user_id = ${o.buyerId ?? '00000000-0000-0000-0000-000000000000'}) as my_rating
-    from market_order_items i where i.order_id = ${id} order by i.total_pesewas desc`)
-  const events = await db.execute<{ id: string; kind: string; note: string | null; created_at: Date; actor: string | null }>(sql`
-    select e.id, e.kind, e.note, e.created_at, (select u.full_name from users u where u.id = e.actor_id) as actor from market_order_events e where e.order_id = ${id} order by e.created_at, e.id`)
-  const requests = await db.select().from(schema.marketRequests).where(eq(schema.marketRequests.orderId, id)).orderBy(desc(schema.marketRequests.createdAt))
-  const [shop] = o.shopId ? await db.select({ slug: schema.shops.slug, logoUrl: schema.shops.logoUrl, phone: schema.shops.phone, returnDays: schema.shops.returnDays }).from(schema.shops).where(eq(schema.shops.id, o.shopId)) : []
-  const people = await db.execute<{ id: string; full_name: string; username: string; avatar_url: string | null }>(sql`select id, full_name, username, avatar_url from users where id in (${o.buyerId ?? o.id}, ${o.sellerId ?? o.id})`)
-  const person = (pid: string | null) => { const p = people.rows.find((x) => x.id === pid); return p ? { id: p.id, fullName: p.full_name, username: p.username, avatarUrl: p.avatar_url } : null }
-  const [pay] = o.checkoutId ? await db.select({ reference: schema.payments.reference, status: schema.payments.status, channel: schema.payments.channel })
-    .from(schema.payments).where(eq(schema.payments.marketCheckoutId, o.checkoutId)).orderBy(desc(schema.payments.createdAt)).limit(1) : []
+  const { data, error } = await createSupabaseAdminClient().rpc('papa_market_order_detail', {
+    p_order_id: id, p_viewer_id: user.id, p_viewer_role: user.role,
+  })
+  if (error) throw new Error(`Unable to load market order: ${error.message}`)
+  if (!data) return null
+  type DetailPayload = {
+    order: Record<string, unknown>
+    items: { id: string; product_id: string | null; title: string; variant_name: string; image: string | null; unit_pesewas: number; qty: number; total_pesewas: number; my_rating: number | null }[]
+    events: { id: string; kind: string; note: string | null; created_at: string; actor: string | null }[]
+    requests: { id: string; kind: 'cancel' | 'return' | 'refund'; reason: string; details: string | null; status: 'open' | 'approved' | 'declined' | 'withdrawn' | 'escalated'; response: string | null; refund_pesewas: number | null; created_at: string; resolved_at: string | null; escalated_at: string | null; escalation_note: string | null }[]
+    shop: { slug: string; logo_url: string | null; phone: string | null; return_days: number } | null
+    people: { id: string; full_name: string; username: string; avatar_url: string | null }[]
+    payment: { reference: string; status: string; channel: string } | null
+    delivery: { id: string; status: 'open' | 'accepted' | 'picked_up' | 'delivered' | 'cancelled'; fee_pesewas: number; created_at: string; accepted_at: string | null; picked_up_at: string | null; delivered_at: string | null; rider_name: string | null; rider_username: string | null; rider_phone: string | null; rider_vehicle: string | null; rider_user_id: string | null } | null
+    role: 'buyer' | 'seller' | 'admin' | null
+  }
+  const payload = data as DetailPayload
+  const camelize = (value: Record<string, unknown>) => Object.fromEntries(Object.entries(value).map(([key, item]) => [key.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase()), item]))
+  const o = camelize(payload.order) as unknown as typeof schema.marketOrders.$inferSelect
+  for (const key of ['createdAt', 'paidAt', 'acceptedAt', 'packedAt', 'shippedAt', 'deliveredAt', 'completedAt', 'cancelledAt'] as const) {
+    const value = o[key]
+    if (typeof value === 'string') (o as unknown as Record<string, unknown>)[key] = new Date(value)
+  }
+  const role = payload.role
+  if (!role) return null
+  const requests = payload.requests.map((r) => ({
+    id: r.id, kind: r.kind, reason: r.reason, details: r.details, status: r.status, response: r.response, refundPesewas: r.refund_pesewas,
+    createdAt: new Date(r.created_at), resolvedAt: r.resolved_at ? new Date(r.resolved_at) : null,
+    escalatedAt: r.escalated_at ? new Date(r.escalated_at) : null, escalationNote: r.escalation_note,
+  }))
+  const shop = payload.shop
+  const person = (pid: string | null) => { const p = payload.people.find((x) => x.id === pid); return p ? { id: p.id, fullName: p.full_name, username: p.username, avatarUrl: p.avatar_url } : null }
+  const pay = payload.payment
   const open = requests.find((r) => r.status === 'open' || r.status === 'escalated') ?? null
   const declined = requests.find((r) => r.status === 'declined' && r.resolvedAt && Date.now() - r.resolvedAt.getTime() < ESCALATE_DAYS * 86_400_000) ?? null
-  const dRows = await db.execute<{ id: string; status: 'open' | 'accepted' | 'picked_up' | 'delivered' | 'cancelled'; fee_pesewas: number; created_at: Date; accepted_at: Date | null; picked_up_at: Date | null; delivered_at: Date | null
-    rider_name: string | null; rider_username: string | null; rider_phone: string | null; rider_vehicle: string | null; rider_user_id: string | null }>(sql`
-    select d.id, d.status, d.fee_pesewas, d.created_at, d.accepted_at, d.picked_up_at, d.delivered_at, u.full_name as rider_name, u.username as rider_username, r.phone as rider_phone, r.vehicle as rider_vehicle, r.user_id as rider_user_id
-    from deliveries d left join riders r on r.id = d.rider_id left join users u on u.id = r.user_id where d.order_id = ${id} and d.status <> 'cancelled' order by d.created_at desc limit 1`)
-  const d = dRows.rows[0]
+  const d = payload.delivery
   const delivery = d ? { id: d.id, status: d.status, feePesewas: d.fee_pesewas, createdAt: iso(d.created_at)!, acceptedAt: iso(d.accepted_at), pickedUpAt: iso(d.picked_up_at), deliveredAt: iso(d.delivered_at),
     rider: d.rider_name ? { name: d.rider_name, username: d.rider_username!, phone: d.rider_phone, vehicle: d.rider_vehicle, userId: d.rider_user_id! } : null } : null
   const riderBusy = !!delivery && delivery.status !== 'delivered'
-  const returnDays = shop?.returnDays ?? 0
+  const returnDays = shop?.return_days ?? 0
   const withinReturn = !!o.deliveredAt && returnDays > 0 && Date.now() - o.deliveredAt.getTime() < returnDays * 86_400_000
   const buyer = role === 'buyer'
   return {
     ...o, createdAt: iso(o.createdAt)!, paidAt: iso(o.paidAt), acceptedAt: iso(o.acceptedAt), packedAt: iso(o.packedAt), shippedAt: iso(o.shippedAt), deliveredAt: iso(o.deliveredAt),
     completedAt: iso(o.completedAt), cancelledAt: iso(o.cancelledAt),
-    role, shopSlug: shop?.slug ?? null, shopLogo: shop?.logoUrl ?? null, shopPhone: shop?.phone ?? null, returnDays, buyer: person(o.buyerId), seller: person(o.sellerId),
-    // The hand-over code is the buyer's to show; the seller enters it
+    role, shopSlug: shop?.slug ?? null, shopLogo: shop?.logo_url ?? null, shopPhone: shop?.phone ?? null, returnDays, buyer: person(o.buyerId), seller: person(o.sellerId),
     handoverCode: buyer ? o.handoverCode : null,
-    items: items.rows.map((i) => ({ id: i.id, productId: i.product_id, title: i.title, variantName: i.variant_name, image: i.image, unitPesewas: i.unit_pesewas, qty: i.qty, totalPesewas: i.total_pesewas, myRating: i.my_rating })),
-    events: events.rows.map((e) => ({ id: e.id, kind: e.kind, note: e.note, at: iso(e.created_at)!, actor: e.actor })),
-    requests: requests.map((r) => ({ id: r.id, kind: r.kind, reason: r.reason, details: r.details, status: r.status, response: r.response, refundPesewas: r.refundPesewas, createdAt: iso(r.createdAt)!, resolvedAt: iso(r.resolvedAt),
-      escalatedAt: iso(r.escalatedAt), escalationNote: r.escalationNote })),
+    items: payload.items.map((i) => ({ id: i.id, productId: i.product_id, title: i.title, variantName: i.variant_name, image: i.image, unitPesewas: i.unit_pesewas, qty: i.qty, totalPesewas: i.total_pesewas, myRating: i.my_rating })),
+    events: payload.events.map((e) => ({ id: e.id, kind: e.kind, note: e.note, at: iso(e.created_at)!, actor: e.actor })),
+    requests: requests.map((r) => ({ ...r, createdAt: iso(r.createdAt)!, resolvedAt: iso(r.resolvedAt), escalatedAt: iso(r.escalatedAt) })),
     payment: pay ?? null, delivery,
     can: {
       cancel: buyer && o.status === 'paid',
@@ -130,11 +139,14 @@ export type OrderDetail = NonNullable<Awaited<ReturnType<typeof getOrder>>>
  * When everything in a checkout has been refunded, the payment itself is marked refunded.
  */
 export async function refundOrder(orderId: string, amountPesewas: number, actorId: string | null, note: string): Promise<{ ok: true } | { ok: false; error: 'amount' | 'not_paid' | 'refund_failed' }> {
-  const [o] = await db.select().from(schema.marketOrders).where(eq(schema.marketOrders.id, orderId))
-  if (!o?.paidAt || !o.checkoutId) return { ok: false, error: 'not_paid' }
-  const left = o.totalPesewas - o.refundedPesewas
+  const client = createSupabaseAdminClient()
+  const { data: o, error: orderError } = await client.from('market_orders').select('*').eq('id', orderId).maybeSingle()
+  if (orderError) throw new Error(`Unable to load order for refund: ${orderError.message}`)
+  if (!o?.paid_at || !o.checkout_id) return { ok: false, error: 'not_paid' }
+  const left = o.total_pesewas - o.refunded_pesewas
   if (!Number.isInteger(amountPesewas) || amountPesewas < 1 || amountPesewas > left || o.escrow === 'released') return { ok: false, error: 'amount' }
-  const [p] = await db.select().from(schema.payments).where(and(eq(schema.payments.marketCheckoutId, o.checkoutId), sql`${schema.payments.status} in ('success', 'refunded')`))
+  const { data: p, error: paymentError } = await client.from('payments').select('id,reference').eq('market_checkout_id', o.checkout_id).in('status', ['success', 'refunded']).order('created_at', { ascending: false }).limit(1).maybeSingle()
+  if (paymentError) throw new Error(`Unable to load order payment: ${paymentError.message}`)
   if (!p) return { ok: false, error: 'not_paid' }
   const r = await refundPayment(p.reference, amountPesewas, `${o.number}: ${note}`)
   if (!r.ok) return { ok: false, error: 'refund_failed' }
@@ -145,11 +157,16 @@ export async function refundOrder(orderId: string, amountPesewas: number, actorI
   if (recordError) throw new Error(`Unable to record market refund: ${recordError.message}`)
   if (!recorded?.length) return { ok: false, error: 'amount' }
   await orderEvent(orderId, 'refunded', actorId, ghs(amountPesewas))
-  const all = await db.execute<{ left: number }>(sql`select coalesce(sum(total_pesewas - refunded_pesewas), 0)::int as left from market_orders where checkout_id = ${o.checkoutId} and paid_at is not null`)
-  if (all.rows[0].left === 0) await db.update(schema.payments).set({ status: 'refunded' }).where(eq(schema.payments.id, p.id))
-  if (o.buyerId) {
-    await notify(o.buyerId, 'market_order', null, null, { marketOrderId: orderId }).catch(() => {})
-    const [b] = await db.select({ phone: schema.users.phone }).from(schema.users).where(eq(schema.users.id, o.buyerId))
+  const { data: checkoutOrders, error: checkoutError } = await client.from('market_orders').select('total_pesewas,refunded_pesewas').eq('checkout_id', o.checkout_id).not('paid_at', 'is', null)
+  if (checkoutError) throw new Error(`Unable to check checkout refund status: ${checkoutError.message}`)
+  if ((checkoutOrders ?? []).reduce((sum, item) => sum + item.total_pesewas - item.refunded_pesewas, 0) === 0) {
+    const { error } = await client.from('payments').update({ status: 'refunded' }).eq('id', p.id)
+    if (error) throw new Error(`Unable to update refunded payment: ${error.message}`)
+  }
+  if (o.buyer_id) {
+    await notify(o.buyer_id, 'market_order', null, null, { marketOrderId: orderId }).catch(() => {})
+    const { data: b, error: buyerError } = await client.from('users').select('phone').eq('id', o.buyer_id).maybeSingle()
+    if (buyerError) throw new Error(`Unable to load buyer phone: ${buyerError.message}`)
     if (b?.phone) await sendSms(b.phone, `PAPA Market: ${ghs(amountPesewas)} for order ${o.number} is being refunded to the account you paid with.`).catch(() => {})
   }
   return { ok: true }
@@ -204,7 +221,10 @@ export async function cancelOrder(user: Who, orderId: string, reason: string, de
 }
 
 async function openRequest(o: OrderDetail, kind: 'cancel' | 'return' | 'refund', reason: string, details?: string) {
-  const [r] = await db.insert(schema.marketRequests).values({ orderId: o.id, buyerId: o.buyerId, kind, reason, details: details?.trim().slice(0, 1000) || null }).returning()
+  const { data: r, error } = await createSupabaseAdminClient().from('market_requests').insert({
+    order_id: o.id, buyer_id: o.buyerId, kind, reason, details: details?.trim().slice(0, 1000) || null,
+  }).select('id').single()
+  if (error) throw new Error(`Unable to open market request: ${error.message}`)
   await orderEvent(o.id, `${kind}_requested`, o.buyerId, reason)
   if (o.sellerId) await notify(o.sellerId, 'market_sale', o.buyerId, null, { marketOrderId: o.id }).catch(() => {})
   return r
@@ -224,9 +244,10 @@ export async function requestReturn(user: Who, orderId: string, kind: 'return' |
 
 export async function withdrawRequest(user: Who, requestId: string) {
   if (!isId(requestId)) return false
-  const [r] = await db.update(schema.marketRequests).set({ status: 'withdrawn', resolvedAt: sql`now()` })
-    .where(and(eq(schema.marketRequests.id, requestId), eq(schema.marketRequests.buyerId, user.id), eq(schema.marketRequests.status, 'open'))).returning()
-  if (r) await orderEvent(r.orderId, 'request_withdrawn', user.id, r.kind)
+  const { data: r, error } = await createSupabaseAdminClient().from('market_requests').update({ status: 'withdrawn', resolved_at: new Date().toISOString() })
+    .eq('id', requestId).eq('buyer_id', user.id).eq('status', 'open').select('order_id,kind').maybeSingle()
+  if (error) throw new Error(`Unable to withdraw market request: ${error.message}`)
+  if (r) await orderEvent(r.order_id, 'request_withdrawn', user.id, r.kind)
   return !!r
 }
 
@@ -236,8 +257,9 @@ export async function escalateRequest(user: Who, orderId: string, note: string):
   if (!o || o.role !== 'buyer') return { ok: false, error: 'not_found' }
   if (!note?.trim() || note.length > 1000) return { ok: false, error: 'reason' }
   if (!o.can.escalate || !o.declinedRequest) return { ok: false, error: 'state' }
-  const [r] = await db.update(schema.marketRequests).set({ status: 'escalated', escalatedAt: sql`now()`, escalationNote: note.trim() })
-    .where(and(eq(schema.marketRequests.id, o.declinedRequest.id), eq(schema.marketRequests.status, 'declined'))).returning()
+  const { data: r, error } = await createSupabaseAdminClient().from('market_requests').update({ status: 'escalated', escalated_at: new Date().toISOString(), escalation_note: note.trim() })
+    .eq('id', o.declinedRequest.id).eq('status', 'declined').select('id').maybeSingle()
+  if (error) throw new Error(`Unable to escalate market request: ${error.message}`)
   if (!r) return { ok: false, error: 'state' }
   await orderEvent(orderId, 'dispute_opened', user.id, null)
   if (o.sellerId) await notify(o.sellerId, 'market_sale', user.id, null, { marketOrderId: orderId }).catch(() => {})
@@ -247,13 +269,15 @@ export async function escalateRequest(user: Who, orderId: string, note: string):
 /** "I received it": the buyer confirms delivery (the seller is paid after the return window, Batch 18). */
 export async function confirmReceived(user: Who, orderId: string) {
   if (!isId(orderId)) return false
-  const [o] = await db.update(schema.marketOrders).set({ status: 'delivered', deliveredAt: sql`now()` })
-    .where(and(eq(schema.marketOrders.id, orderId), eq(schema.marketOrders.buyerId, user.id), eq(schema.marketOrders.status, 'shipped'))).returning()
+  const client = createSupabaseAdminClient()
+  const { data: o, error } = await client.from('market_orders').update({ status: 'delivered', delivered_at: new Date().toISOString() })
+    .eq('id', orderId).eq('buyer_id', user.id).eq('status', 'shipped').select('seller_id').maybeSingle()
+  if (error) throw new Error(`Unable to confirm market delivery: ${error.message}`)
   if (!o) return false
   await orderEvent(orderId, 'delivered', user.id, 'confirmed_by_buyer')
-  // The rider carrying it is done too (and gets paid with the order)
-  await db.update(schema.deliveries).set({ status: 'delivered', deliveredAt: sql`now()` }).where(and(eq(schema.deliveries.orderId, orderId), eq(schema.deliveries.status, 'picked_up')))
-  if (o.sellerId) await notify(o.sellerId, 'market_sale', user.id, null, { marketOrderId: orderId }).catch(() => {})
+  const { error: deliveryError } = await client.from('deliveries').update({ status: 'delivered', delivered_at: new Date().toISOString() }).eq('order_id', orderId).eq('status', 'picked_up')
+  if (deliveryError) throw new Error(`Unable to complete market delivery: ${deliveryError.message}`)
+  if (o.seller_id) await notify(o.seller_id, 'market_sale', user.id, null, { marketOrderId: orderId }).catch(() => {})
   return true
 }
 
@@ -265,13 +289,21 @@ export async function writeReview(user: Who, orderId: string, productId: string,
   if (!o || o.role !== 'buyer') return { ok: false, error: 'not_found' }
   if (!o.can.review) return { ok: false, error: 'state' }
   if (!isId(productId) || !o.items.some((i) => i.productId === productId)) return { ok: false, error: 'not_found' }
-  const [old] = await db.select().from(schema.productReviews).where(and(eq(schema.productReviews.productId, productId), eq(schema.productReviews.userId, user.id)))
+  const client = createSupabaseAdminClient()
+  const { data: old, error: oldError } = await client.from('product_reviews').select('id,rating,hidden_at').eq('product_id', productId).eq('user_id', user.id).maybeSingle()
+  if (oldError) throw new Error(`Unable to load existing product review: ${oldError.message}`)
   if (old) {
-    await db.update(schema.productReviews).set({ rating, body: body.trim(), orderId, updatedAt: sql`now()` }).where(eq(schema.productReviews.id, old.id))
-    if (!old.hiddenAt) await db.execute(sql`update products set rating_sum = rating_sum - ${old.rating} + ${rating} where id = ${productId}`)
+    const { error } = await client.from('product_reviews').update({ rating, body: body.trim(), order_id: orderId, updated_at: new Date().toISOString() }).eq('id', old.id)
+    if (error) throw new Error(`Unable to update product review: ${error.message}`)
+    if (!old.hidden_at) {
+      const { error: totalsError } = await client.rpc('papa_market_adjust_product_rating', { p_product_id: productId, p_rating_delta: rating - old.rating, p_count_delta: 0 })
+      if (totalsError) throw new Error(`Unable to update product rating: ${totalsError.message}`)
+    }
   } else {
-    await db.insert(schema.productReviews).values({ productId, userId: user.id, orderId, rating, body: body.trim() })
-    await db.execute(sql`update products set rating_sum = rating_sum + ${rating}, rating_count = rating_count + 1 where id = ${productId}`)
+    const { error } = await client.from('product_reviews').insert({ product_id: productId, user_id: user.id, order_id: orderId, rating, body: body.trim() })
+    if (error) throw new Error(`Unable to save product review: ${error.message}`)
+    const { error: totalsError } = await client.rpc('papa_market_adjust_product_rating', { p_product_id: productId, p_rating_delta: rating, p_count_delta: 1 })
+    if (totalsError) throw new Error(`Unable to update product rating: ${totalsError.message}`)
     if (o.sellerId) await notify(o.sellerId, 'market_review', user.id, null, { productId }).catch(() => {})
   }
   return { ok: true }
@@ -280,17 +312,19 @@ export async function writeReview(user: Who, orderId: string, productId: string,
 /** The shop owner replies to a review (once; replying again changes it). */
 export async function replyToReview(user: Who, reviewId: string, reply: string) {
   if (!isId(reviewId) || !reply?.trim() || reply.length > 1000) return false
-  const r = await db.execute(sql`update product_reviews r set seller_reply = ${reply.trim()}, seller_reply_at = now() from products p join shops s on s.id = p.shop_id
-    where r.id = ${reviewId} and p.id = r.product_id and s.owner_id = ${user.id} returning r.id`)
-  return r.rows.length > 0
+  const { data, error } = await createSupabaseAdminClient().rpc('papa_market_reply_review', {
+    p_review_id: reviewId, p_user_id: user.id, p_reply: reply.trim(),
+  })
+  if (error) throw new Error(`Unable to reply to product review: ${error.message}`)
+  return !!data
 }
 
 /** A Tech Admin hides a review (it stops counting in the rating). */
 export async function hideReview(reviewId: string) {
   if (!isId(reviewId)) return false
-  const [r] = await db.update(schema.productReviews).set({ hiddenAt: sql`now()` }).where(and(eq(schema.productReviews.id, reviewId), sql`${schema.productReviews.hiddenAt} is null`)).returning()
-  if (r) await db.execute(sql`update products set rating_sum = greatest(rating_sum - ${r.rating}, 0), rating_count = greatest(rating_count - 1, 0) where id = ${r.productId}`)
-  return !!r
+  const { data, error } = await createSupabaseAdminClient().rpc('papa_market_hide_review', { p_review_id: reviewId })
+  if (error) throw new Error(`Unable to hide product review: ${error.message}`)
+  return !!data
 }
 
 /* ───────── Seller ───────── */
@@ -299,10 +333,12 @@ export async function sellerStep(user: Who, orderId: string, step: 'accept' | 'p
   const o = await getOrder(user, orderId)
   if (!o || o.role !== 'seller') return { ok: false, error: 'not_found' }
   if (!o.can[step]) return { ok: false, error: 'state' }
-  const set = step === 'accept' ? { status: 'accepted' as const, acceptedAt: sql`now()` } : step === 'pack' ? { status: 'packed' as const, packedAt: sql`now()` } : { status: 'shipped' as const, shippedAt: sql`now()` }
+  const timestamp = new Date().toISOString()
+  const set = step === 'accept' ? { status: 'accepted', accepted_at: timestamp } : step === 'pack' ? { status: 'packed', packed_at: timestamp } : { status: 'shipped', shipped_at: timestamp }
   const from = step === 'accept' ? ['paid'] : step === 'pack' ? ['accepted'] : ['accepted', 'packed']
-  const r = await db.update(schema.marketOrders).set(set).where(and(eq(schema.marketOrders.id, orderId), sql`${schema.marketOrders.status} in ${from}`)).returning()
-  if (!r.length) return { ok: false, error: 'state' }
+  const { data: changed, error } = await createSupabaseAdminClient().from('market_orders').update(set).eq('id', orderId).in('status', from).select('id').maybeSingle()
+  if (error) throw new Error(`Unable to update order status: ${error.message}`)
+  if (!changed) return { ok: false, error: 'state' }
   const kind = step === 'accept' ? 'accepted' : step === 'pack' ? 'packed' : o.fulfilment === 'pickup' ? 'ready_for_pickup' : 'shipped'
   await orderEvent(orderId, kind, user.id, note?.trim().slice(0, 300) || null)
   if (o.buyerId) await notify(o.buyerId, 'market_order', null, null, { marketOrderId: orderId }).catch(() => {})
@@ -312,35 +348,44 @@ export async function sellerStep(user: Who, orderId: string, step: 'accept' | 'p
 
 /** Texts the buyer their hand-over code when the order leaves the shop (or is ready to collect). */
 export async function textHandoverCode(orderId: string) {
-  const [o] = await db.select().from(schema.marketOrders).where(eq(schema.marketOrders.id, orderId))
-  if (!o?.buyerId) return
-  const [b] = await db.select({ phone: schema.users.phone }).from(schema.users).where(eq(schema.users.id, o.buyerId))
+  const client = createSupabaseAdminClient()
+  const { data: o, error } = await client.from('market_orders').select('buyer_id,number,fulfilment,pickup_address,shop_name,handover_code').eq('id', orderId).maybeSingle()
+  if (error) throw new Error(`Unable to load handover order: ${error.message}`)
+  if (!o?.buyer_id) return
+  const { data: b, error: buyerError } = await client.from('users').select('phone').eq('id', o.buyer_id).maybeSingle()
+  if (buyerError) throw new Error(`Unable to load buyer contact: ${buyerError.message}`)
   if (b?.phone) await sendSms(b.phone, o.fulfilment === 'pickup'
-    ? `PAPA Market: Order ${o.number} is ready for pickup at ${o.pickupAddress ?? o.shopName}. Show code ${o.handoverCode} when you collect.`
-    : `PAPA Market: Order ${o.number} is on its way. Give code ${o.handoverCode} to the person who delivers it, only when you have your items.`).catch(() => {})
+    ? `PAPA Market: Order ${o.number} is ready for pickup at ${o.pickup_address ?? o.shop_name}. Show code ${o.handover_code} when you collect.`
+    : `PAPA Market: Order ${o.number} is on its way. Give code ${o.handover_code} to the person who delivers it, only when you have your items.`).catch(() => {})
 }
 
 /** Checks the buyer's code and marks the order delivered (seller or rider at hand-over). */
 export async function deliverWithCode(orderId: string, actorId: string, code: string, note: string): Promise<{ ok: true } | Fail<'state' | 'code'>> {
-  const [o] = await db.select().from(schema.marketOrders).where(eq(schema.marketOrders.id, orderId))
+  const client = createSupabaseAdminClient()
+  const { data: o, error } = await client.from('market_orders').select('status,handover_code,buyer_id').eq('id', orderId).maybeSingle()
+  if (error) throw new Error(`Unable to load handover order: ${error.message}`)
   if (!o || o.status !== 'shipped') return { ok: false, error: 'state' }
   if (!(await hit(`mkt-code:${orderId}`, 10, 3600))) return { ok: false, error: 'code' }
-  if (!code || code.trim() !== o.handoverCode) return { ok: false, error: 'code' }
-  const r = await db.update(schema.marketOrders).set({ status: 'delivered', deliveredAt: sql`now()` }).where(and(eq(schema.marketOrders.id, orderId), eq(schema.marketOrders.status, 'shipped'))).returning()
-  if (!r.length) return { ok: false, error: 'state' }
+  if (!code || code.trim() !== o.handover_code) return { ok: false, error: 'code' }
+  const { data: changed, error: updateError } = await client.from('market_orders').update({ status: 'delivered', delivered_at: new Date().toISOString() })
+    .eq('id', orderId).eq('status', 'shipped').select('id').maybeSingle()
+  if (updateError) throw new Error(`Unable to complete market handover: ${updateError.message}`)
+  if (!changed) return { ok: false, error: 'state' }
   await orderEvent(orderId, 'delivered', actorId, note)
-  if (o.buyerId) await notify(o.buyerId, 'market_order', null, null, { marketOrderId: orderId }).catch(() => {})
+  if (o.buyer_id) await notify(o.buyer_id, 'market_order', null, null, { marketOrderId: orderId }).catch(() => {})
   return { ok: true }
 }
 
 /** At hand-over the seller enters the buyer's code: the order is delivered. */
 export async function sellerHandover(user: Who, orderId: string, code: string): Promise<{ ok: true; error?: never } | Fail<'not_found' | 'state' | 'code'>> {
   if (!isId(orderId)) return { ok: false, error: 'not_found' }
-  const [o] = await db.select().from(schema.marketOrders).where(eq(schema.marketOrders.id, orderId))
-  if (!o || o.sellerId !== user.id) return { ok: false, error: 'not_found' }
-  // A PAPA rider carrying the order hands it over themself
-  const busy = await db.$count(schema.deliveries, and(eq(schema.deliveries.orderId, orderId), sql`${schema.deliveries.status} in ('open', 'accepted', 'picked_up')`))
-  if (o.status !== 'shipped' || busy) return { ok: false, error: 'state' }
+  const client = createSupabaseAdminClient()
+  const { data: o, error } = await client.from('market_orders').select('seller_id,status').eq('id', orderId).maybeSingle()
+  if (error) throw new Error(`Unable to load seller handover order: ${error.message}`)
+  if (!o || o.seller_id !== user.id) return { ok: false, error: 'not_found' }
+  const { data: activeDeliveries, error: deliveryError } = await client.from('deliveries').select('id').eq('order_id', orderId).in('status', ['open', 'accepted', 'picked_up']).limit(1)
+  if (deliveryError) throw new Error(`Unable to check active deliveries: ${deliveryError.message}`)
+  if (o.status !== 'shipped' || !!activeDeliveries?.length) return { ok: false, error: 'state' }
   return deliverWithCode(orderId, user.id, code, 'code_checked')
 }
 
@@ -359,8 +404,10 @@ export async function sellerCancel(user: Who, orderId: string, reason: string): 
  */
 export async function answerRequest(user: Who, requestId: string, approve: boolean, response: string, refundPesewas?: number | null): Promise<{ ok: true } | Fail<'not_found' | 'state' | 'amount' | 'refund_failed' | 'not_paid'>> {
   if (!isId(requestId)) return { ok: false, error: 'not_found' }
-  const [r] = await db.select().from(schema.marketRequests).where(eq(schema.marketRequests.id, requestId))
-  if (!r) return { ok: false, error: 'not_found' }
+  const { data: rawRequest, error: requestError } = await createSupabaseAdminClient().from('market_requests').select('id,order_id,kind,reason,status').eq('id', requestId).maybeSingle()
+  if (requestError) throw new Error(`Unable to load market request: ${requestError.message}`)
+  if (!rawRequest) return { ok: false, error: 'not_found' }
+  const r = { id: rawRequest.id, orderId: rawRequest.order_id, kind: rawRequest.kind as 'cancel' | 'return' | 'refund', reason: rawRequest.reason, status: rawRequest.status as 'open' | 'escalated' }
   const o = await getOrder(user, r.orderId)
   if (!o || (o.role !== 'seller' && o.role !== 'admin')) return { ok: false, error: 'not_found' }
   if (r.status !== 'open' && !(r.status === 'escalated' && o.role === 'admin')) return { ok: false, error: 'state' }
@@ -370,8 +417,11 @@ export async function answerRequest(user: Who, requestId: string, approve: boole
     amount = refundPesewas ?? Math.min(left, r.kind === 'refund' ? left : o.subtotalPesewas - o.discountPesewas - o.refundedPesewas)
     if (!Number.isInteger(amount) || amount < 1 || amount > left) return { ok: false, error: 'amount' }
   }
-  const [claimed] = await db.update(schema.marketRequests).set({ status: approve ? 'approved' : 'declined', response: response?.trim().slice(0, 1000) || null, handledBy: user.id,
-    resolvedAt: sql`now()`, refundPesewas: approve ? (r.kind === 'cancel' ? left : amount) : null }).where(and(eq(schema.marketRequests.id, requestId), eq(schema.marketRequests.status, r.status))).returning()
+  const { data: claimed, error: claimError } = await createSupabaseAdminClient().from('market_requests').update({
+    status: approve ? 'approved' : 'declined', response: response?.trim().slice(0, 1000) || null, handled_by: user.id,
+    resolved_at: new Date().toISOString(), refund_pesewas: approve ? (r.kind === 'cancel' ? left : amount) : null,
+  }).eq('id', requestId).eq('status', r.status).select('id').maybeSingle()
+  if (claimError) throw new Error(`Unable to answer market request: ${claimError.message}`)
   if (!claimed) return { ok: false, error: 'state' }
   await orderEvent(o.id, r.status === 'escalated' ? `dispute_${approve ? 'buyer' : 'seller'}` : `${r.kind}_${approve ? 'approved' : 'declined'}`, user.id, response?.trim().slice(0, 300) || null)
   if (r.status === 'escalated' && o.sellerId) await notify(o.sellerId, 'market_sale', null, null, { marketOrderId: o.id }).catch(() => {})
@@ -381,7 +431,8 @@ export async function answerRequest(user: Who, requestId: string, approve: boole
     if (r.kind === 'cancel') amount = left
     const done = await refundOrder(o.id, amount, user.id, `${r.kind} approved`)
     if (!done.ok) {
-      await db.update(schema.marketRequests).set({ status: r.status, handledBy: null, resolvedAt: null, refundPesewas: null }).where(eq(schema.marketRequests.id, requestId))
+      const { error: rollbackError } = await createSupabaseAdminClient().from('market_requests').update({ status: r.status, handled_by: null, resolved_at: null, refund_pesewas: null }).eq('id', requestId)
+      if (rollbackError) throw new Error(`Unable to restore market request: ${rollbackError.message}`)
       return done
     }
   } else if (o.buyerId) await notify(o.buyerId, 'market_order', null, null, { marketOrderId: o.id }).catch(() => {})
@@ -402,9 +453,10 @@ export async function adminRefund(admin: Who, orderId: string, amountPesewas: nu
 /* ───────── Background job ───────── */
 /** Paid orders the seller never accepted are cancelled and refunded, so buyers' money is never stuck. */
 export async function cancelUnacceptedOrders() {
-  const due = await db.select({ id: schema.marketOrders.id }).from(schema.marketOrders)
-    .where(and(eq(schema.marketOrders.status, 'paid'), sql`${schema.marketOrders.paidAt} < now() - make_interval(hours => ${ACCEPT_WITHIN_HOURS})`)).limit(50)
+  const cutoff = new Date(Date.now() - ACCEPT_WITHIN_HOURS * 3_600_000).toISOString()
+  const { data: due, error } = await createSupabaseAdminClient().from('market_orders').select('id').eq('status', 'paid').lt('paid_at', cutoff).limit(50)
+  if (error) throw new Error(`Unable to find unaccepted market orders: ${error.message}`)
   let n = 0
-  for (const o of due) if (await cancelPaid(o.id, 'system', null, 'not_accepted_in_time')) n++
+  for (const o of due ?? []) if (await cancelPaid(o.id, 'system', null, 'not_accepted_in_time')) n++
   return n
 }
