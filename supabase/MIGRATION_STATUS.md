@@ -24,7 +24,7 @@ The remaining 38 files are mainly Drizzle schema definitions, database initializ
 
 ## Validation status
 
-- `pnpm run supabase:verify`: passed; all 36 bundled individual RPC migrations match their migration files, including `0053`.
+- `pnpm run supabase:verify`: passed; all 37 bundled individual RPC migrations match their migration files, including `0053` and `0054`.
 - `pnpm run typecheck`: passed after the cart/checkout changes.
 - Focused Market/Seller/Rider Vitest suites: **blocked before tests ran** because their shared Drizzle cleanup connection failed with `SELF_SIGNED_CERT_IN_CHAIN`; all 42 tests were skipped.
 - Supabase RPC integration probes and SQL execution on a disposable database remain unverified. Migration `0053` applied successfully to the connected Supabase project; broader integration checks are still required.
